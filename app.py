@@ -1,11 +1,13 @@
-import pandas as pd
+import time
+from io import StringIO
+
 import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import requests
 import yfinance as yf
-import plotly.graph_objects as go
-
-from io import StringIO
-from dash import Dash, dcc, html, Input, Output, dash_table
+from dash import Dash, Input, Output, State, dcc, html
+from flask_caching import Cache
 from plotly.subplots import make_subplots
 
 NSE_EQUITY_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
@@ -27,10 +29,12 @@ NEWS_FEEDS = [
     ("TradingView India", "https://in.tradingview.com/markets/stocks-india/"),
 ]
 
+
 def fetch_csv(url: str) -> pd.DataFrame:
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return pd.read_csv(StringIO(r.text))
+
 
 def load_nse_stocks(include_series=DEFAULT_SERIES) -> pd.DataFrame:
     df = fetch_csv(NSE_EQUITY_URL)
@@ -48,11 +52,13 @@ def load_nse_stocks(include_series=DEFAULT_SERIES) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["SYMBOL"]).sort_values("SYMBOL").reset_index(drop=True)
     return df
 
+
 def make_dropdown_options(df):
     return [
         {"label": f"{row['SYMBOL']} - {row['NAME OF COMPANY']}", "value": row["SYMBOL"]}
         for _, row in df.iterrows()
     ]
+
 
 def rsi(series, period=14):
     delta = series.diff()
@@ -66,6 +72,7 @@ def rsi(series, period=14):
     out = 100 - (100 / (1 + rs))
     return out.fillna(50)
 
+
 def macd(series, fast=12, slow=26, signal=9):
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
@@ -74,12 +81,14 @@ def macd(series, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+
 def atr(df, period=14):
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift()).abs()
     low_close = (df["Low"] - df["Close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+
 
 def adx(df, period=14):
     up_move = df["High"].diff()
@@ -98,6 +107,7 @@ def adx(df, period=14):
     minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(period).sum() / atr_val
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
     return dx.rolling(period).mean()
+
 
 def supertrend(df, period=10, multiplier=3):
     hl2 = (df["High"] + df["Low"]) / 2
@@ -147,6 +157,7 @@ def supertrend(df, period=10, multiplier=3):
 
     return trend, direction
 
+
 def add_indicators(df):
     df = df.copy()
     df["SMA20"] = df["Close"].rolling(20).mean()
@@ -166,11 +177,13 @@ def add_indicators(df):
     df["SUPERTREND"], df["ST_DIR"] = supertrend(df, 10, 3)
     return df
 
+
 def nearest_levels(df, lookback=40):
     recent = df.tail(lookback)
     support = round(float(recent["Low"].min()), 2) if not recent.empty else None
     resistance = round(float(recent["High"].max()), 2) if not recent.empty else None
     return support, resistance
+
 
 def generate_signal(df):
     last = df.iloc[-1]
@@ -246,6 +259,7 @@ def generate_signal(df):
     confidence = min(95, max(35, 50 + abs(score) * 7))
     return signal, score, confidence, reasons
 
+
 def order_plan(df):
     last = df.iloc[-1]
     support, resistance = nearest_levels(df)
@@ -273,6 +287,7 @@ def order_plan(df):
         "sell_t1": t1_sell,
         "sell_t2": t2_sell,
     }
+
 
 def build_chart(df, symbol):
     fig = make_subplots(
@@ -334,19 +349,51 @@ def build_chart(df, symbol):
     )
     return fig
 
+
+app = Dash(__name__)
+server = app.server
+app.title = "Blast NSE Lab"
+
+cache = Cache(app.server, config={
+    "CACHE_TYPE": "SimpleCache",
+    "CACHE_DEFAULT_TIMEOUT": 600
+})
+
+
+@cache.memoize(timeout=600)
 def fetch_stock_history(symbol):
-    ticker = yf.Ticker(f"{symbol}.NS")
-    df = ticker.history(period="1y", interval="1d", auto_adjust=False)
-    if df.empty:
-        raise ValueError(f"No market data found for {symbol}")
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-    return df
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker(f"{symbol}.NS")
+            df = ticker.history(period="1y", interval="1d", auto_adjust=False)
+
+            if df.empty:
+                raise ValueError(f"No market data found for {symbol}")
+
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+            return df
+
+        except Exception as e:
+            last_error = e
+            msg = str(e).lower()
+
+            if "too many requests" in msg or "rate limited" in msg:
+                time.sleep(5 * (attempt + 1))
+            else:
+                break
+
+    raise ValueError(f"Yahoo Finance temporarily unavailable for {symbol}: {last_error}")
+
 
 def make_tv_symbol(symbol):
     return f"NSE:{symbol}"
 
+
 def screener_url(symbol):
     return f"https://www.screener.in/company/{symbol}/"
+
 
 def price_snapshot(df):
     last = df.iloc[-1]
@@ -362,6 +409,7 @@ def price_snapshot(df):
         "volume": int(last["Volume"]),
     }
 
+
 def card_style():
     return {
         "background": "linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03))",
@@ -372,29 +420,14 @@ def card_style():
         "boxShadow": "0 10px 24px rgba(0,0,0,0.18)",
     }
 
+
 def small_title(text):
     return html.Div(text, style={"color": "#8EA7BA", "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "0.8px"})
+
 
 def big_value(text, color="#EAF2F8", size="24px"):
     return html.Div(text, style={"fontSize": size, "fontWeight": "800", "color": color, "marginTop": "10px"})
 
-def tab_style():
-    return {
-        "backgroundColor": "#0d1620",
-        "color": "#A9BDCC",
-        "border": "1px solid #203040",
-        "padding": "12px",
-        "fontWeight": "700"
-    }
-
-def tab_selected_style():
-    return {
-        "backgroundColor": "#122232",
-        "color": "#EAF2F8",
-        "border": "1px solid #14B8A6",
-        "padding": "12px",
-        "fontWeight": "800"
-    }
 
 def info_panel(title, children):
     return html.Div(
@@ -410,6 +443,7 @@ def info_panel(title, children):
         ]
     )
 
+
 def metric_row(label, value):
     val = "-" if pd.isna(value) else round(float(value), 2)
     return html.Div(
@@ -424,6 +458,7 @@ def metric_row(label, value):
             html.Strong(str(val), style={"color": "#EAF2F8"})
         ]
     )
+
 
 def trade_box(label, value, color):
     return html.Div(
@@ -443,8 +478,10 @@ def trade_box(label, value, color):
         ]
     )
 
+
 def section_subtitle(text):
     return html.Div(text, style={"marginBottom": "10px", "fontWeight": "800", "fontSize": "16px", "color": "#D8E6EF"})
+
 
 def link_btn():
     return {
@@ -455,8 +492,36 @@ def link_btn():
         "border": "1px solid #1D3B47",
         "color": "#DFF7FF",
         "fontWeight": "700",
-        "display": "inline-block"
+        "display": "inline-block",
+        "marginRight": "10px",
+        "marginBottom": "10px"
     }
+
+
+def error_box(message):
+    return html.Div(
+        [
+            html.Div("Data Error", style={
+                "fontSize": "18px",
+                "fontWeight": "800",
+                "marginBottom": "8px",
+                "color": "#FFD6D6"
+            }),
+            html.Div(message, style={
+                "fontSize": "14px",
+                "lineHeight": "1.6",
+                "color": "#FFEAEA"
+            })
+        ],
+        style={
+            "background": "rgba(255, 77, 109, 0.14)",
+            "border": "1px solid rgba(255, 99, 132, 0.45)",
+            "borderRadius": "14px",
+            "padding": "14px 16px",
+            "marginBottom": "16px"
+        }
+    )
+
 
 try:
     stocks_df = load_nse_stocks()
@@ -467,9 +532,99 @@ except Exception as e:
     dropdown_options = []
     universe_msg = f"NSE load failed: {e}"
 
-app = Dash(__name__)
-server = app.server
-app.title = "Blast NSE Lab"
+
+initial_error = None
+initial_symbol = DEFAULT_SYMBOL
+initial_fig = go.Figure()
+initial_signal = html.Div()
+initial_summary = html.Div()
+initial_trade = html.Div()
+initial_metrics = html.Div()
+
+try:
+    _df0 = fetch_stock_history(DEFAULT_SYMBOL)
+    _df0 = add_indicators(_df0)
+    _signal0, _score0, _confidence0, _reasons0 = generate_signal(_df0)
+    _plan0 = order_plan(_df0)
+    _snap0 = price_snapshot(_df0)
+    initial_fig = build_chart(_df0, DEFAULT_SYMBOL)
+
+    signal_color0 = {
+        "STRONG BUY": "#22C55E",
+        "BUY": "#4ADE80",
+        "HOLD": "#FACC15",
+        "SELL": "#FB7185",
+        "STRONG SELL": "#F43F5E"
+    }.get(_signal0, "#EAF2F8")
+
+    initial_signal = html.Div([
+        small_title("Signal"),
+        big_value(_signal0, color=signal_color0, size="30px"),
+        html.Div(f"Score: {_score0} | Confidence: {_confidence0}%", style={
+            "marginTop": "8px",
+            "color": "#A8BBC8"
+        }),
+        html.Ul([html.Li(r) for r in _reasons0], style={"marginTop": "12px", "paddingLeft": "18px"})
+    ], style=card_style())
+
+    initial_summary = html.Div([
+        html.Div([small_title("Last Close"), big_value(f"₹ {_snap0['close']}")]),
+        html.Div([small_title("Day Change"), big_value(
+            f"{_snap0['change']} ({_snap0['change_pct']}%)",
+            "#52D273" if _snap0["change"] >= 0 else "#FF5C7A"
+        )], style={"marginTop": "12px"}),
+        html.Div([small_title("Day Range"), html.Div(
+            f"₹ {_snap0['low']} - ₹ {_snap0['high']}",
+            style={"marginTop": "10px", "fontWeight": "700"}
+        )], style={"marginTop": "12px"}),
+        html.Div([small_title("Volume"), html.Div(
+            f"{_snap0['volume']:,}",
+            style={"marginTop": "10px", "fontWeight": "700"}
+        )], style={"marginTop": "12px"})
+    ], style=card_style())
+
+    initial_trade = html.Div([
+        section_subtitle("Buy Plan"),
+        trade_box("Entry", _plan0["buy_entry"], "#52D273"),
+        trade_box("Stop Loss", _plan0["buy_sl"], "#FFB4B4"),
+        trade_box("Target 1", _plan0["buy_t1"], "#7EE787"),
+        trade_box("Target 2", _plan0["buy_t2"], "#A7F3D0"),
+        html.Br(),
+        section_subtitle("Sell Plan"),
+        trade_box("Entry", _plan0["sell_entry"], "#FF8A8A"),
+        trade_box("Stop Loss", _plan0["sell_sl"], "#FFD1D1"),
+        trade_box("Target 1", _plan0["sell_t1"], "#FCA5A5"),
+        trade_box("Target 2", _plan0["sell_t2"], "#FECACA")
+    ], style=card_style())
+
+    latest = _df0.iloc[-1]
+    initial_metrics = info_panel("Indicator Snapshot", html.Div([
+        metric_row("RSI 14", latest["RSI14"]),
+        metric_row("MACD", latest["MACD"]),
+        metric_row("Signal", latest["MACD_SIGNAL"]),
+        metric_row("ADX 14", latest["ADX14"]),
+        metric_row("ATR 14", latest["ATR14"]),
+        metric_row("SMA 20", latest["SMA20"]),
+        metric_row("SMA 50", latest["SMA50"]),
+        metric_row("SMA 200", latest["SMA200"]),
+        metric_row("Supertrend", latest["SUPERTREND"]),
+    ]))
+
+except Exception as e:
+    initial_fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#081018",
+        plot_bgcolor="#081018",
+        font=dict(color="#E8F1F8"),
+        height=850,
+        title=f"{DEFAULT_SYMBOL} - Data temporarily unavailable"
+    )
+    msg = str(e)
+    if "too many requests" in msg.lower() or "rate limit" in msg.lower():
+        initial_error = error_box("Yahoo Finance temporarily rate-limited this request. Please wait a few minutes and try again.")
+    else:
+        initial_error = error_box(f"Unable to load initial market data. {msg}")
+
 
 app.layout = html.Div(
     style={
@@ -480,354 +635,232 @@ app.layout = html.Div(
         "padding": "18px",
     },
     children=[
-        dcc.Store(id="stocks-store", data=stocks_df.to_dict("records")),
-        dcc.Store(id="selected-symbol-store", data=DEFAULT_SYMBOL),
         html.Div(
             style={
                 "display": "flex",
                 "justifyContent": "space-between",
                 "alignItems": "center",
                 "gap": "16px",
-                "marginBottom": "18px",
-                "background": "rgba(255,255,255,0.04)",
-                "border": "1px solid rgba(255,255,255,0.08)",
-                "borderRadius": "18px",
-                "padding": "18px 20px",
-                "backdropFilter": "blur(8px)",
+                "flexWrap": "wrap",
+                "marginBottom": "18px"
             },
             children=[
                 html.Div([
-                    html.Div("BLAST NSE LAB", style={"fontSize": "26px", "fontWeight": "800", "letterSpacing": "1px"}),
-                    html.Div("Compact technical scanner • chart room • trade map • news deck", style={"color": "#9FB4C7", "fontSize": "13px", "marginTop": "4px"}),
+                    html.H1("Blast NSE Lab", style={"margin": "0", "fontSize": "34px"}),
+                    html.Div(universe_msg, style={"color": "#90A9BA", "marginTop": "6px"})
                 ]),
-                html.Div(universe_msg, style={"color": "#8BE9A8", "fontSize": "13px"})
+                html.Div([
+                    dcc.Dropdown(
+                        id="stock-dropdown",
+                        options=dropdown_options,
+                        value=DEFAULT_SYMBOL if dropdown_options else None,
+                        placeholder="Select NSE stock",
+                        searchable=True,
+                        clearable=False,
+                        style={
+                            "width": "380px",
+                            "color": "#111",
+                            "borderRadius": "10px"
+                        }
+                    )
+                ])
             ]
         ),
+
+        html.Div(id="error-message", children=initial_error),
+
         html.Div(
-            style={"display": "grid", "gridTemplateColumns": "2.2fr 1fr", "gap": "16px", "marginBottom": "16px"},
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "1fr 1fr 1fr",
+                "gap": "16px",
+                "marginBottom": "18px"
+            },
+            children=[
+                html.Div(id="signal-box", children=initial_signal),
+                html.Div(id="summary-box", children=initial_summary),
+                html.Div(id="trade-plan-box", children=initial_trade),
+            ]
+        ),
+
+        html.Div(
+            style={"marginBottom": "18px"},
+            children=[
+                dcc.Graph(id="main-chart", figure=initial_fig, config={"displayModeBar": True})
+            ]
+        ),
+
+        html.Div(
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "1.2fr 0.8fr",
+                "gap": "16px",
+                "marginBottom": "18px"
+            },
             children=[
                 html.Div(
                     style={
                         "background": "rgba(255,255,255,0.04)",
                         "border": "1px solid rgba(255,255,255,0.08)",
                         "borderRadius": "18px",
-                        "padding": "16px",
+                        "padding": "16px"
                     },
                     children=[
-                        html.Label("NSE Stock Search", style={"fontWeight": "700", "marginBottom": "8px", "display": "block"}),
-                        dcc.Dropdown(
-                            id="stock-dropdown",
-                            options=dropdown_options,
-                            value=DEFAULT_SYMBOL,
-                            multi=False,
-                            placeholder="Select NSE stock",
-                            style={"color": "#111"}
-                        ),
+                        html.H4("Quick Links", style={"marginTop": "0"}),
+                        html.A("TradingView", id="tv-link", href=f"https://www.tradingview.com/symbols/{make_tv_symbol(DEFAULT_SYMBOL).replace(':', '-')}/", target="_blank", style=link_btn()),
+                        html.A("Screener", id="screener-link", href=screener_url(DEFAULT_SYMBOL), target="_blank", style=link_btn()),
+                        *[
+                            html.A(label, href=url, target="_blank", style=link_btn())
+                            for label, url in NEWS_FEEDS
+                        ]
                     ]
                 ),
-                html.Div(
-                    style={
-                        "background": "rgba(255,255,255,0.04)",
-                        "border": "1px solid rgba(255,255,255,0.08)",
-                        "borderRadius": "18px",
-                        "padding": "16px",
-                        "display": "flex",
-                        "alignItems": "center",
-                        "justifyContent": "space-between",
-                        "gap": "10px",
-                    },
-                    children=[
-                        html.Button(
-                            "Refresh Universe",
-                            id="refresh-button",
-                            n_clicks=0,
-                            style={
-                                "background": "#14B8A6",
-                                "color": "#041016",
-                                "border": "none",
-                                "padding": "12px 16px",
-                                "borderRadius": "12px",
-                                "fontWeight": "700",
-                                "cursor": "pointer",
-                                "width": "100%"
-                            }
-                        )
-                    ]
-                ),
+                html.Div(id="metrics-box", children=initial_metrics)
             ]
         ),
+
         html.Div(
-            style={"display": "grid", "gridTemplateColumns": "repeat(6, 1fr)", "gap": "12px", "marginBottom": "16px"},
+            style={
+                "background": "rgba(255,255,255,0.04)",
+                "border": "1px solid rgba(255,255,255,0.08)",
+                "borderRadius": "18px",
+                "padding": "16px"
+            },
             children=[
-                html.Div(id="card-price", style=card_style()),
-                html.Div(id="card-change", style=card_style()),
-                html.Div(id="card-signal", style=card_style()),
-                html.Div(id="card-rsi", style=card_style()),
-                html.Div(id="card-trend", style=card_style()),
-                html.Div(id="card-levels", style=card_style()),
+                html.H4("Notes", style={"marginTop": "0"}),
+                html.Ul([
+                    html.Li("Signals are rule-based and meant for educational use only."),
+                    html.Li("Data is cached for 10 minutes to reduce rate-limit issues."),
+                    html.Li("If Yahoo Finance rate-limits requests, wait a few minutes and retry."),
+                ], style={"paddingLeft": "18px", "color": "#B8CAD6"})
             ]
-        ),
-        dcc.Tabs(
-            id="main-tabs",
-            value="tab-overview",
-            colors={"border": "#203040", "primary": "#14B8A6", "background": "#0d1620"},
-            children=[
-                dcc.Tab(label="Overview", value="tab-overview", style=tab_style(), selected_style=tab_selected_style()),
-                dcc.Tab(label="TradingView", value="tab-tv", style=tab_style(), selected_style=tab_selected_style()),
-                dcc.Tab(label="Orders & Signal", value="tab-orders", style=tab_style(), selected_style=tab_selected_style()),
-                dcc.Tab(label="News & Links", value="tab-news", style=tab_style(), selected_style=tab_selected_style()),
-                dcc.Tab(label="Universe", value="tab-universe", style=tab_style(), selected_style=tab_selected_style()),
-            ]
-        ),
-        html.Div(id="tab-content", style={"marginTop": "16px"})
+        )
     ]
 )
 
-@app.callback(
-    Output("stocks-store", "data"),
-    Output("stock-dropdown", "options"),
-    Input("refresh-button", "n_clicks"),
-    prevent_initial_call=True,
-)
-def refresh_universe(n):
-    df = load_nse_stocks()
-    return df.to_dict("records"), make_dropdown_options(df)
 
 @app.callback(
-    Output("selected-symbol-store", "data"),
+    Output("main-chart", "figure"),
+    Output("signal-box", "children"),
+    Output("summary-box", "children"),
+    Output("trade-plan-box", "children"),
+    Output("metrics-box", "children"),
+    Output("error-message", "children"),
+    Output("tv-link", "href"),
+    Output("screener-link", "href"),
     Input("stock-dropdown", "value"),
+    prevent_initial_call=False
 )
-def sync_selected_symbol(symbol):
-    return symbol or DEFAULT_SYMBOL
+def update_dashboard(symbol):
+    if not symbol:
+        symbol = DEFAULT_SYMBOL
 
-@app.callback(
-    Output("card-price", "children"),
-    Output("card-change", "children"),
-    Output("card-signal", "children"),
-    Output("card-rsi", "children"),
-    Output("card-trend", "children"),
-    Output("card-levels", "children"),
-    Input("selected-symbol-store", "data"),
-)
-def update_top_cards(symbol):
     try:
-        df = add_indicators(fetch_stock_history(symbol))
-        snap = price_snapshot(df)
+        df = fetch_stock_history(symbol)
+        df = add_indicators(df)
+
         signal, score, confidence, reasons = generate_signal(df)
         plan = order_plan(df)
-        st_dir = df["ST_DIR"].iloc[-1]
-        rsi_val = round(float(df["RSI14"].iloc[-1]), 2)
+        snap = price_snapshot(df)
+        fig = build_chart(df, symbol)
+        latest = df.iloc[-1]
 
-        change_color = "#52D273" if snap["change"] >= 0 else "#FF5C7A"
-        signal_color = "#52D273" if "BUY" in signal else "#FF5C7A" if "SELL" in signal else "#F9A826"
-        trend_color = "#52D273" if st_dir == "Bullish" else "#FF5C7A"
+        signal_color = {
+            "STRONG BUY": "#22C55E",
+            "BUY": "#4ADE80",
+            "HOLD": "#FACC15",
+            "SELL": "#FB7185",
+            "STRONG SELL": "#F43F5E"
+        }.get(signal, "#EAF2F8")
+
+        signal_ui = html.Div([
+            small_title("Signal"),
+            big_value(signal, color=signal_color, size="30px"),
+            html.Div(f"Score: {score} | Confidence: {confidence}%", style={
+                "marginTop": "8px",
+                "color": "#A8BBC8"
+            }),
+            html.Ul([html.Li(r) for r in reasons], style={"marginTop": "12px", "paddingLeft": "18px"})
+        ], style=card_style())
+
+        summary_ui = html.Div([
+            html.Div([small_title("Last Close"), big_value(f"₹ {snap['close']}", "#EAF2F8")]),
+            html.Div([small_title("Day Change"), big_value(
+                f"{snap['change']} ({snap['change_pct']}%)",
+                "#52D273" if snap["change"] >= 0 else "#FF5C7A"
+            )], style={"marginTop": "12px"}),
+            html.Div([small_title("Day Range"), html.Div(
+                f"₹ {snap['low']} - ₹ {snap['high']}",
+                style={"marginTop": "10px", "fontWeight": "700"}
+            )], style={"marginTop": "12px"}),
+            html.Div([small_title("Volume"), html.Div(
+                f"{snap['volume']:,}",
+                style={"marginTop": "10px", "fontWeight": "700"}
+            )], style={"marginTop": "12px"})
+        ], style=card_style())
+
+        trade_ui = html.Div([
+            section_subtitle("Buy Plan"),
+            trade_box("Entry", plan["buy_entry"], "#52D273"),
+            trade_box("Stop Loss", plan["buy_sl"], "#FFB4B4"),
+            trade_box("Target 1", plan["buy_t1"], "#7EE787"),
+            trade_box("Target 2", plan["buy_t2"], "#A7F3D0"),
+            html.Br(),
+            section_subtitle("Sell Plan"),
+            trade_box("Entry", plan["sell_entry"], "#FF8A8A"),
+            trade_box("Stop Loss", plan["sell_sl"], "#FFD1D1"),
+            trade_box("Target 1", plan["sell_t1"], "#FCA5A5"),
+            trade_box("Target 2", plan["sell_t2"], "#FECACA")
+        ], style=card_style())
+
+        metrics_ui = info_panel("Indicator Snapshot", html.Div([
+            metric_row("RSI 14", latest["RSI14"]),
+            metric_row("MACD", latest["MACD"]),
+            metric_row("Signal", latest["MACD_SIGNAL"]),
+            metric_row("ADX 14", latest["ADX14"]),
+            metric_row("ATR 14", latest["ATR14"]),
+            metric_row("SMA 20", latest["SMA20"]),
+            metric_row("SMA 50", latest["SMA50"]),
+            metric_row("SMA 200", latest["SMA200"]),
+            metric_row("Supertrend", latest["SUPERTREND"]),
+        ]))
+
+        tv_href = f"https://www.tradingview.com/symbols/{make_tv_symbol(symbol).replace(':', '-')}/"
+        screener_href = screener_url(symbol)
+
+        return fig, signal_ui, summary_ui, trade_ui, metrics_ui, None, tv_href, screener_href
+
+    except Exception as e:
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#081018",
+            plot_bgcolor="#081018",
+            font=dict(color="#E8F1F8"),
+            height=850,
+            title=f"{symbol} - Data temporarily unavailable"
+        )
+
+        msg = str(e)
+        if "too many requests" in msg.lower() or "rate limit" in msg.lower():
+            friendly = "Yahoo Finance temporarily rate-limited this request. Please wait a few minutes and try again."
+        else:
+            friendly = f"Unable to load market data for {symbol}. {msg}"
+
+        tv_href = f"https://www.tradingview.com/symbols/{make_tv_symbol(symbol).replace(':', '-')}/"
+        screener_href = screener_url(symbol)
 
         return (
-            [small_title("Last Price"), big_value(f"₹ {snap['close']}"), html.Div(f"H {snap['high']} • L {snap['low']}", style={"color": "#94A9B8", "marginTop": "6px"})],
-            [small_title("Day Change"), big_value(f"{snap['change']} ({snap['change_pct']}%)", change_color), html.Div(f"Vol {snap['volume']:,}", style={"color": "#94A9B8", "marginTop": "6px"})],
-            [small_title("AI Signal"), big_value(signal, signal_color), html.Div(f"Score {score} • Confidence {confidence}%", style={"color": "#94A9B8", "marginTop": "6px"})],
-            [small_title("RSI 14"), big_value(str(rsi_val), "#B388FF"), html.Div("30 oversold • 70 overbought", style={"color": "#94A9B8", "marginTop": "6px"})],
-            [small_title("Trend Engine"), big_value(st_dir, trend_color), html.Div(f"ADX {round(float(df['ADX14'].iloc[-1]), 2)}", style={"color": "#94A9B8", "marginTop": "6px"})],
-            [small_title("S/R Levels"), big_value(f"{plan['support']} / {plan['resistance']}", "#00E5FF", size="20px"), html.Div("Support / Resistance", style={"color": "#94A9B8", "marginTop": "6px"})],
+            empty_fig,
+            html.Div(),
+            html.Div(),
+            html.Div(),
+            html.Div(),
+            error_box(friendly),
+            tv_href,
+            screener_href
         )
-    except Exception as e:
-        err = [small_title("Status"), big_value("Data Error", "#FF5C7A"), html.Div(str(e), style={"color": "#94A9B8", "marginTop": "6px", "fontSize": "12px"})]
-        return err, err, err, err, err, err
 
-@app.callback(
-    Output("tab-content", "children"),
-    Input("main-tabs", "value"),
-    Input("selected-symbol-store", "data"),
-    Input("stocks-store", "data"),
-)
-def render_tab(tab, symbol, stocks_data):
-    try:
-        df = add_indicators(fetch_stock_history(symbol))
-        signal, score, confidence, reasons = generate_signal(df)
-        plan = order_plan(df)
-        chart = build_chart(df.tail(220), symbol)
-        tv_symbol = make_tv_symbol(symbol)
-        last = df.iloc[-1]
-
-        if tab == "tab-overview":
-            return html.Div(
-                style={"display": "grid", "gridTemplateColumns": "2fr 1fr", "gap": "16px"},
-                children=[
-                    info_panel("Technical Chart", dcc.Graph(figure=chart, config={"displayModeBar": True})),
-                    html.Div(
-                        style={"display": "grid", "gap": "16px"},
-                        children=[
-                            info_panel(
-                                "Indicator Snapshot",
-                                html.Div([
-                                    metric_row("SMA20", last["SMA20"]),
-                                    metric_row("SMA50", last["SMA50"]),
-                                    metric_row("SMA200", last["SMA200"]),
-                                    metric_row("RSI14", last["RSI14"]),
-                                    metric_row("MACD", last["MACD"]),
-                                    metric_row("MACD Signal", last["MACD_SIGNAL"]),
-                                    metric_row("ATR14", last["ATR14"]),
-                                    metric_row("ADX14", last["ADX14"]),
-                                    metric_row("Supertrend", last["SUPERTREND"]),
-                                ])
-                            ),
-                            info_panel(
-                                "Model Readout",
-                                html.Div([
-                                    html.Div(
-                                        f"Signal: {signal}",
-                                        style={
-                                            "fontSize": "22px",
-                                            "fontWeight": "800",
-                                            "color": "#14E0A1" if "BUY" in signal else "#FF5C7A" if "SELL" in signal else "#F9A826"
-                                        }
-                                    ),
-                                    html.Div(f"Confidence: {confidence}%", style={"marginTop": "6px", "color": "#A6BDCB"}),
-                                    html.Ul([html.Li(r) for r in reasons], style={"marginTop": "10px", "color": "#D7E4ED", "paddingLeft": "18px"}),
-                                    html.Div("Model is rule-based technical scoring, not guaranteed financial advice.", style={"marginTop": "12px", "fontSize": "12px", "color": "#7E97AA"})
-                                ])
-                            ),
-                        ]
-                    )
-                ]
-            )
-
-        if tab == "tab-tv":
-            tv_html = f"""
-            <html>
-            <head>
-            <meta charset="utf-8"/>
-            <style>
-            body{{margin:0;background:#081018;font-family:Arial;color:#fff;}}
-            .wrap{{padding:8px;}}
-            .box{{border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,.08);}}
-            </style>
-            </head>
-            <body>
-                <div class="wrap">
-                    <div class="box">
-                        <iframe
-                            src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_chart&symbol={tv_symbol}&interval=D&hidesidetoolbar=0&symboledit=1&saveimage=1&toolbarbg=0b1723&theme=dark&style=1&timezone=Asia%2FKolkata"
-                            style="width:100%;height:760px;border:0;"
-                            allowtransparency="true"
-                            scrolling="no">
-                        </iframe>
-                    </div>
-                </div>
-            </body>
-            </html>
-            """
-            return html.Div(
-                style={"display": "grid", "gridTemplateColumns": "1fr", "gap": "16px"},
-                children=[
-                    info_panel(
-                        "TradingView Advanced View",
-                        html.Iframe(srcDoc=tv_html, style={"width": "100%", "height": "790px", "border": "0", "borderRadius": "16px"})
-                    ),
-                    info_panel(
-                        "Platform Links",
-                        html.Div([
-                            html.A("Open in Screener", href=screener_url(symbol), target="_blank", rel="noopener noreferrer", style=link_btn()),
-                            html.A("Open in TradingView India", href=f"https://in.tradingview.com/symbols/{tv_symbol.replace(':', '-')}/", target="_blank", rel="noopener noreferrer", style=link_btn()),
-                        ], style={"display": "flex", "gap": "10px", "flexWrap": "wrap"})
-                    )
-                ]
-            )
-
-        if tab == "tab-orders":
-            return html.Div(
-                style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"},
-                children=[
-                    info_panel(
-                        "Auto Trade Plan",
-                        html.Div([
-                            section_subtitle("Long Setup"),
-                            trade_box("Buy Entry", plan["buy_entry"], "#14E0A1"),
-                            trade_box("Stop Loss", plan["buy_sl"], "#FF5C7A"),
-                            trade_box("Target 1", plan["buy_t1"], "#00E5FF"),
-                            trade_box("Target 2", plan["buy_t2"], "#00E5FF"),
-                            html.Hr(style={"borderColor": "rgba(255,255,255,0.08)", "margin": "16px 0"}),
-                            section_subtitle("Short Setup"),
-                            trade_box("Sell Entry", plan["sell_entry"], "#FFB020"),
-                            trade_box("Stop Loss", plan["sell_sl"], "#FF5C7A"),
-                            trade_box("Target 1", plan["sell_t1"], "#00E5FF"),
-                            trade_box("Target 2", plan["sell_t2"], "#00E5FF"),
-                        ])
-                    ),
-                    info_panel(
-                        "Order Analysis",
-                        html.Div([
-                            html.Div(f"Signal: {signal}", style={"fontSize": "22px", "fontWeight": "800"}),
-                            html.Div(f"Support: {plan['support']} | Resistance: {plan['resistance']}", style={"marginTop": "8px", "color": "#A8BBC8"}),
-                            html.Div(f"ATR-based levels adapt to volatility for {symbol}.", style={"marginTop": "8px", "color": "#A8BBC8"}),
-                            html.Ul([html.Li(r) for r in reasons], style={"marginTop": "10px", "paddingLeft": "18px"}),
-                            html.Div(
-                                "Use confirmation from price action, volume, and broader index context before live execution.",
-                                style={"marginTop": "12px", "fontSize": "12px", "color": "#7E97AA"}
-                            )
-                        ])
-                    )
-                ]
-            )
-
-        if tab == "tab-news":
-            query_links = [
-                html.A(name, href=url, target="_blank", rel="noopener noreferrer", style=link_btn())
-                for name, url in NEWS_FEEDS
-            ]
-            symbol_news = [
-                html.A(f"{symbol} on Google News", href=f"https://news.google.com/search?q={symbol}%20NSE%20stock", target="_blank", rel="noopener noreferrer", style=link_btn()),
-                html.A(f"{symbol} on Economic Times", href=f"https://economictimes.indiatimes.com/topic/{symbol}", target="_blank", rel="noopener noreferrer", style=link_btn()),
-                html.A(f"{symbol} on Moneycontrol", href=f"https://www.moneycontrol.com/stocks/cptmarket/compsearchnew.php?search_data={symbol}", target="_blank", rel="noopener noreferrer", style=link_btn()),
-            ]
-            return html.Div(
-                style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"},
-                children=[
-                    info_panel("Market News Deck", html.Div(query_links, style={"display": "flex", "gap": "10px", "flexWrap": "wrap"})),
-                    info_panel("Symbol News Search", html.Div(symbol_news, style={"display": "flex", "gap": "10px", "flexWrap": "wrap"})),
-                ]
-            )
-
-        if tab == "tab-universe":
-            dfu = pd.DataFrame(stocks_data)
-            if dfu.empty:
-                return info_panel("NSE Stock Universe", html.Div("No data loaded.", style={"color": "#FF7B9C"}))
-
-            view = dfu[["SYMBOL", "NAME OF COMPANY", "SERIES", "DATE OF LISTING", "ISIN NUMBER", "FACE VALUE"]].copy().head(1000)
-            view.columns = ["Symbol", "Company", "Series", "Listing Date", "ISIN", "Face Value"]
-
-            return info_panel(
-                "NSE Stock Universe",
-                dash_table.DataTable(
-                    data=view.to_dict("records"),
-                    columns=[{"name": c, "id": c} for c in view.columns],
-                    page_size=20,
-                    sort_action="native",
-                    filter_action="native",
-                    style_table={"overflowX": "auto"},
-                    style_cell={
-                        "backgroundColor": "#0B1723",
-                        "color": "#EAF2F8",
-                        "border": "1px solid #1D2B36",
-                        "textAlign": "left",
-                        "padding": "8px",
-                        "fontSize": "13px",
-                        "whiteSpace": "normal",
-                        "height": "auto",
-                    },
-                    style_header={
-                        "backgroundColor": "#102130",
-                        "color": "#8BE9A8",
-                        "fontWeight": "700",
-                        "border": "1px solid #1D2B36",
-                    },
-                )
-            )
-
-        return html.Div("No tab selected.")
-
-    except Exception as e:
-        return info_panel("Error", html.Div(str(e), style={"color": "#FF7B9C"}))
 
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=8050)
+    app.run(debug=True)
