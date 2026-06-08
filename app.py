@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 
 NSE_EQUITY_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 DEFAULT_SYMBOL = "RELIANCE"
-TOP_SCAN_LIMIT = 20
+TOP_SCAN_LIMIT = 220
 LOOKBACK_DAYS = 260
 NSE_HOME = "https://www.nseindia.com"
 NSE_REPORTS_URL = "https://www.nseindia.com/all-reports"
