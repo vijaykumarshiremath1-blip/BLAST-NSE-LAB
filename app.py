@@ -271,4 +271,3 @@ def generate_signal(df):
     elif score <= -5:
         signal = "STRONG SELL"
     elif score <= -2:
-      
