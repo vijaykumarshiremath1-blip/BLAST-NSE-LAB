@@ -2,6 +2,7 @@ import time
 from io import StringIO
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,10 @@ import yfinance as yf
 from dash import Dash, Input, Output, dcc, html, dash_table, no_update
 from flask_caching import Cache
 from plotly.subplots import make_subplots
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 NSE_EQUITY_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 DEFAULT_SERIES = ("EQ",)
@@ -121,17 +126,22 @@ def fetch_csv(url: str) -> pd.DataFrame:
 
 
 def load_nse_stocks(include_series=DEFAULT_SERIES) -> pd.DataFrame:
-    df = fetch_csv(NSE_EQUITY_URL)
-    df.columns = [str(c).strip() for c in df.columns]
-    required = ["SYMBOL", "NAME OF COMPANY", "SERIES"]
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"Missing column in NSE file: {col}")
-    for col in df.columns:
-        df[col] = df[col].astype(str).str.strip()
-    df = df[df["SERIES"].isin(include_series)].copy()
-    df = df.drop_duplicates(subset=["SYMBOL"]).sort_values("SYMBOL").reset_index(drop=True)
-    return df
+    try:
+        df = fetch_csv(NSE_EQUITY_URL)
+        df.columns = [str(c).strip() for c in df.columns]
+        required = ["SYMBOL", "NAME OF COMPANY", "SERIES"]
+        for col in required:
+            if col not in df.columns:
+                raise ValueError(f"Missing column in NSE file: {col}")
+        for col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+        df = df[df["SERIES"].isin(include_series)].copy()
+        df = df.drop_duplicates(subset=["SYMBOL"]).sort_values("SYMBOL").reset_index(drop=True)
+        logger.info(f"Loaded {len(df)} NSE stocks successfully")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading NSE stocks: {e}")
+        return pd.DataFrame(columns=["SYMBOL", "NAME OF COMPANY"])
 
 
 def rsi(series, period=14):
@@ -351,6 +361,7 @@ def fetch_stock_history(symbol):
             if df.empty:
                 raise ValueError(f"No market data found for {symbol}")
             df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+            logger.info(f"Successfully fetched history for {symbol}")
             return df
         except Exception as e:
             last_error = e
@@ -359,72 +370,93 @@ def fetch_stock_history(symbol):
                 time.sleep(3 * (attempt + 1))
             else:
                 break
+    logger.error(f"Failed to fetch history for {symbol}: {last_error}")
     raise ValueError(f"Yahoo Finance temporarily unavailable for {symbol}: {last_error}")
 
 
 @cache.memoize(timeout=1800)
 def fetch_stock_info(symbol):
-    ticker = yf.Ticker(f"{symbol}.NS")
-    info = ticker.info or {}
     try:
-        fast = ticker.fast_info or {}
-        for k, v in fast.items():
-            info.setdefault(k, v)
-    except Exception:
-        pass
-    return info
+        ticker = yf.Ticker(f"{symbol}.NS")
+        info = ticker.info or {}
+        try:
+            fast = ticker.fast_info or {}
+            for k, v in fast.items():
+                info.setdefault(k, v)
+        except Exception as e:
+            logger.warning(f"Could not fetch fast_info for {symbol}: {e}")
+        logger.info(f"Fetched info for {symbol}: {len(info)} fields")
+        return info
+    except Exception as e:
+        logger.error(f"Error fetching info for {symbol}: {e}")
+        return {}
 
 
 @cache.memoize(timeout=1800)
 def fetch_stock_news(symbol):
-    ticker = yf.Ticker(f"{symbol}.NS")
-    news = getattr(ticker, "news", []) or []
-    cleaned = []
-    for item in news[:15]:
-        content = item.get("content", {}) if isinstance(item, dict) else {}
-        cleaned.append({
-            "title": content.get("title") or item.get("title") or "Untitled",
-            "summary": content.get("summary") or item.get("summary") or "",
-            "publisher": content.get("provider", {}).get("displayName") or item.get("publisher") or "Source",
-            "link": content.get("canonicalUrl", {}).get("url") or item.get("link") or "",
-            "published": content.get("pubDate") or item.get("providerPublishTime") or "",
-        })
-    return cleaned
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        news = getattr(ticker, "news", []) or []
+        cleaned = []
+        for item in news[:15]:
+            content = item.get("content", {}) if isinstance(item, dict) else {}
+            cleaned.append({
+                "title": content.get("title") or item.get("title") or "Untitled",
+                "summary": content.get("summary") or item.get("summary") or "",
+                "publisher": content.get("provider", {}).get("displayName") or item.get("publisher") or "Source",
+                "link": content.get("canonicalUrl", {}).get("url") or item.get("link") or "",
+                "published": content.get("pubDate") or item.get("providerPublishTime") or "",
+            })
+        logger.info(f"Fetched {len(cleaned)} news items for {symbol}")
+        return cleaned
+    except Exception as e:
+        logger.warning(f"Could not fetch news for {symbol}: {e}")
+        return []
 
 
 @cache.memoize(timeout=1800)
 def fetch_holders_tables(symbol):
-    ticker = yf.Ticker(f"{symbol}.NS")
-    out = {}
-    for name, attr in [("major_holders", "major_holders"), ("institutional_holders", "institutional_holders"), ("mutualfund_holders", "mutualfund_holders")]:
-        try:
-            df = getattr(ticker, attr)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                out[name] = df.reset_index(drop=True)
-        except Exception:
-            pass
-    return out
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        out = {}
+        for name, attr in [("major_holders", "major_holders"), ("institutional_holders", "institutional_holders"), ("mutualfund_holders", "mutualfund_holders")]:
+            try:
+                df = getattr(ticker, attr)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    out[name] = df.reset_index(drop=True)
+                    logger.info(f"Fetched {name} for {symbol}")
+            except Exception as e:
+                logger.debug(f"Could not fetch {name} for {symbol}: {e}")
+        return out
+    except Exception as e:
+        logger.warning(f"Error fetching holders for {symbol}: {e}")
+        return {}
 
 
 @cache.memoize(timeout=1800)
 def fetch_financial_tables(symbol):
-    ticker = yf.Ticker(f"{symbol}.NS")
-    tables = {}
-    for key, attr in {
-        "income_stmt": "income_stmt",
-        "quarterly_income_stmt": "quarterly_income_stmt",
-        "balance_sheet": "balance_sheet",
-        "quarterly_balance_sheet": "quarterly_balance_sheet",
-        "cashflow": "cashflow",
-        "quarterly_cashflow": "quarterly_cashflow",
-    }.items():
-        try:
-            df = getattr(ticker, attr)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                tables[key] = df.copy()
-        except Exception:
-            pass
-    return tables
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        tables = {}
+        for key, attr in {
+            "income_stmt": "income_stmt",
+            "quarterly_income_stmt": "quarterly_income_stmt",
+            "balance_sheet": "balance_sheet",
+            "quarterly_balance_sheet": "quarterly_balance_sheet",
+            "cashflow": "cashflow",
+            "quarterly_cashflow": "quarterly_cashflow",
+        }.items():
+            try:
+                df = getattr(ticker, attr)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    tables[key] = df.copy()
+                    logger.info(f"Fetched {key} for {symbol}")
+            except Exception as e:
+                logger.debug(f"Could not fetch {key} for {symbol}: {e}")
+        return tables
+    except Exception as e:
+        logger.warning(f"Error fetching financials for {symbol}: {e}")
+        return {}
 
 
 def price_snapshot(df, info=None):
@@ -479,18 +511,18 @@ def nse_bulk_url():
 
 
 def style_card(children, height=None):
-    style = {"background": f"linear-gradient(180deg, {THEME['panel2']}, {THEME['panel']})", "border": f"1px solid {THEME['border']}", "borderRadius": "18px", "padding": "18px", "boxShadow": "0 12px 28px rgba(0,0,0,0.28)"}
+    style = {"background": f"linear-gradient(180deg, {THEME['panel2']}, {THEME['panel']})", "border": f"1px solid {THEME['border']}", "borderRadius": "18px", "padding": "18px", "boxShadow": "0 12px 28px rgba(0,0,0,0.3)"}
     if height:
         style["minHeight"] = height
     return html.Div(children, style=style)
 
 
 def stat_card(title, value, sub=None, color=None):
-    return style_card([html.Div(title, style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(value, style={"color": color or THEME["text"], "fontSize": "26px", "fontWeight": "800", "marginTop": "10px"}), html.Div(sub or "", style={"color": THEME["faint"], "fontSize": "13px", "marginTop": "8px"})], height="118px")
+    return style_card([html.Div(title, style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(value, style={"color": color or THEME["text"], "fontSize": "28px", "fontWeight": "800", "marginTop": "8px"}), html.Div(sub or "", style={"fontSize": "12px", "color": THEME["faint"], "marginTop": "4px"})])
 
 
 def metric_line(label, value):
-    return html.Div([html.Span(label, style={"color": THEME["muted"]}), html.Strong(value, style={"color": THEME["text"]})], style={"display": "flex", "justifyContent": "space-between", "padding": "10px 0", "borderBottom": f"1px solid {THEME['border']}"})
+    return html.Div([html.Span(label, style={"color": THEME["muted"]}), html.Strong(value, style={"color": THEME["text"]})], style={"display": "flex", "justifyContent": "space-between", "padding": "10px 0"})
 
 
 def make_chart(df, symbol, indicators):
@@ -520,7 +552,7 @@ def make_chart(df, symbol, indicators):
         fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14", line=dict(color="#b38cff", width=1.8)), row=3, col=1)
         fig.add_hline(y=70, line_dash="dash", line_color="#fb7185", row=3, col=1)
         fig.add_hline(y=30, line_dash="dash", line_color="#34d399", row=3, col=1)
-    fig.update_layout(template="plotly_dark", paper_bgcolor=THEME["bg"], plot_bgcolor=THEME["bg"], font=dict(color=THEME["text"]), xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=50, b=20), height=860, legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), title=f"{symbol} Chart Lab")
+    fig.update_layout(template="plotly_dark", paper_bgcolor=THEME["bg"], plot_bgcolor=THEME["bg"], font=dict(color=THEME["text"]), xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=50, b=20), showlegend=True, hovermode="x unified")
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
     return fig
@@ -535,7 +567,7 @@ def df_to_table(df, rows=12):
     else:
         show.columns = [str(c) for c in show.columns]
     show = show.reset_index().rename(columns={show.index.name or "index": "Metric"}).fillna("")
-    return dash_table.DataTable(data=show.to_dict("records"), columns=[{"name": c, "id": c} for c in show.columns], style_as_list_view=True, style_table={"overflowX": "auto"}, style_header={"backgroundColor": THEME["bg3"], "color": THEME["text"], "border": f"1px solid {THEME['border']}", "fontWeight": "700"}, style_cell={"backgroundColor": THEME["panel"], "color": THEME["text"], "border": f"1px solid {THEME['border']}", "padding": "10px", "textAlign": "left", "minWidth": "110px", "maxWidth": "260px", "whiteSpace": "normal"}, page_size=rows)
+    return dash_table.DataTable(data=show.to_dict("records"), columns=[{"name": c, "id": c} for c in show.columns], style_as_list_view=True, style_table={"overflowX": "auto"}, style_header={"backgroundColor": THEME["bg3"], "color": THEME["text"], "fontWeight": "700", "border": f"1px solid {THEME['border']}"}, style_cell={"backgroundColor": THEME["panel"], "color": THEME["text"], "border": f"1px solid {THEME['border']}", "padding": "10px", "textAlign": "left"})
 
 
 def holders_summary(info, holders):
@@ -544,13 +576,13 @@ def holders_summary(info, holders):
     if isinstance(major, pd.DataFrame) and major.shape[1] >= 2:
         for _, row in major.iterrows():
             major_map[str(row.iloc[1])] = row.iloc[0]
-    rows = [("FII / Institutional", fmt_pct(info.get("heldPercentInstitutions")) if info else "-"), ("Promoters / Insiders", fmt_pct(info.get("heldPercentInsiders")) if info else "-"), ("Mutual Funds", major_map.get("% of Shares Held by Institutions", "-")), ("Retail / Public", "Check detailed shareholding in Screener / annual filing")]
+    rows = [("FII / Institutional", fmt_pct(info.get("heldPercentInstitutions")) if info else "-"), ("Promoters / Insiders", fmt_pct(info.get("heldPercentInsiders")) if info else "-"), ("Mutual Funds", fmt_pct(major_map.get("Mutual Funds")) if "Mutual Funds" in major_map else "-")]
     return html.Div([metric_line(a, b) for a, b in rows])
 
 
 def company_overview(symbol, company_name, info):
     summary = info.get("longBusinessSummary") or info.get("description") or "Business summary not available."
-    return style_card([html.Div(f"{company_name} ({symbol})", style={"fontSize": "24px", "fontWeight": "800", "color": THEME["text"]}), html.Div(f"{info.get('sector', '-')} • {info.get('industry', '-')}", style={"marginTop": "6px", "color": THEME["muted"]}), html.P(summary[:900], style={"marginTop": "14px", "color": THEME["text"], "lineHeight": "1.7"})])
+    return style_card([html.Div(f"{company_name} ({symbol})", style={"fontSize": "24px", "fontWeight": "800", "color": THEME["text"]}), html.Div(f"{info.get('sector', '-')} • {info.get('industry', '-')}", style={"fontSize": "12px", "color": THEME["muted"], "marginTop": "4px"}), html.Div(summary, style={"fontSize": "13px", "color": THEME["text"], "marginTop": "12px", "lineHeight": "1.5", "maxHeight": "100px", "overflow": "hidden", "textOverflow": "ellipsis", "display": "-webkit-box", "-webkit-line-clamp": "3", "-webkit-box-orient": "vertical"})])
 
 
 def build_news_cards(news_items):
@@ -558,45 +590,45 @@ def build_news_cards(news_items):
         return style_card(html.Div("No recent news available from Yahoo feed.", style={"color": THEME["muted"]}))
     cards = []
     for item in news_items[:10]:
-        cards.append(style_card([html.Div(item.get("publisher", "Source"), style={"color": THEME["accent"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.A(item.get("title", "Untitled"), href=item.get("link") or None, target="_blank", rel="noopener noreferrer", style={"display": "block", "marginTop": "8px", "color": THEME["text"], "fontWeight": "800", "textDecoration": "none", "fontSize": "17px"}), html.Div(item.get("summary", "")[:240], style={"marginTop": "8px", "color": THEME["muted"], "lineHeight": "1.6"}), html.Div(str(item.get("published", "")), style={"marginTop": "10px", "color": THEME["faint"], "fontSize": "12px"})]))
+        cards.append(style_card([html.Div(item.get("publisher", "Source"), style={"color": THEME["accent"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.A(item.get("title", "Untitled"), href=item.get("link") or "#", target="_blank", style={"color": THEME["text"], "textDecoration": "none", "fontSize": "14px", "fontWeight": "600", "marginTop": "8px", "display": "block"}), html.Div(item.get("summary", "")[:100], style={"fontSize": "12px", "color": THEME["faint"], "marginTop": "6px"})]))
     return html.Div(cards, style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(280px,1fr))", "gap": "16px"})
 
 
 def button_link_style():
-    return {"display": "inline-block", "padding": "10px 14px", "background": THEME["bg3"], "border": f"1px solid {THEME['border']}", "color": THEME["text"], "borderRadius": "12px", "textDecoration": "none", "fontWeight": "700", "marginRight": "10px", "marginBottom": "10px"}
+    return {"display": "inline-block", "padding": "10px 14px", "background": THEME["bg3"], "border": f"1px solid {THEME['border']}", "color": THEME["text"], "borderRadius": "12px", "textDecoration": "none", "marginRight": "8px", "fontSize": "12px"}
 
 
 def build_home_page(symbol, company_name, info, df, signal, score, confidence, reasons, news_items, holders):
     snap = price_snapshot(df, info)
     plan = order_plan(df)
     last = df.iloc[-1]
-    top_cards = html.Div([stat_card("Last Close", fmt_currency_inr(snap["close"]), f"{snap['change']} ({snap['change_pct']}%)", THEME["good"] if snap["change"] >= 0 else THEME["danger"]), stat_card("Day Range", f"₹ {fmt_num(snap['low'])} - ₹ {fmt_num(snap['high'])}", "Day low / high"), stat_card("52 Week Range", f"₹ {fmt_num(snap['low_52'])} - ₹ {fmt_num(snap['high_52'])}", "52-week low / high"), stat_card("Market Cap", fmt_market_cap(info.get("marketCap")), info.get("exchange", "NSE"))], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(220px,1fr))", "gap": "16px"})
-    signal_card = style_card([html.Div("Technical + Flow Signal", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(signal, style={"fontSize": "32px", "fontWeight": "900", "marginTop": "10px", "color": SIGNAL_COLORS.get(signal, THEME['text'])}), html.Div(f"Score: {score}   |   Confidence: {confidence}%", style={"color": THEME["text"], "marginTop": "8px"}), html.Ul([html.Li(r) for r in reasons], style={"marginTop": "12px", "paddingLeft": "18px", "color": THEME["muted"], "lineHeight": "1.8"})])
-    plan_card = style_card([html.Div("Trade Plan", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("Support", fmt_currency_inr(plan["support"])), metric_line("Resistance", fmt_currency_inr(plan["resistance"])), metric_line("Buy Entry", fmt_currency_inr(plan["buy_entry"])), metric_line("Buy Stop Loss", fmt_currency_inr(plan["buy_sl"])), metric_line("Buy Target 1", fmt_currency_inr(plan["buy_t1"])), metric_line("Buy Target 2", fmt_currency_inr(plan["buy_t2"])),])
+    top_cards = html.Div([stat_card("Last Close", fmt_currency_inr(snap["close"]), f"{snap['change']} ({snap['change_pct']}%)", THEME["good"] if snap["change"] >= 0 else THEME["danger"]), stat_card("Day High", fmt_currency_inr(snap["high"])), stat_card("Day Low", fmt_currency_inr(snap["low"])), stat_card("Volume", fmt_int(snap["volume"]))], style={"display": "grid", "gridTemplateColumns": "repeat(4, 1fr)", "gap": "16px"})
+    signal_card = style_card([html.Div("Technical + Flow Signal", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(signal, style={"fontSize": "32px", "fontWeight": "900", "color": SIGNAL_COLORS.get(signal, THEME["text"]), "marginTop": "8px"}), html.Div(f"{confidence}% Confidence", style={"fontSize": "12px", "color": THEME["faint"], "marginTop": "8px"}), html.Div(html.Ul([html.Li(r, style={"fontSize": "12px", "color": THEME["text"], "marginTop": "4px"}) for r in reasons]), style={"marginTop": "12px", "paddingLeft": "16px"})])
+    plan_card = style_card([html.Div("Trade Plan", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("Support", fmt_currency_inr(plan["support"])), metric_line("Resistance", fmt_currency_inr(plan["resistance"])), html.Hr(style={"borderColor": THEME["border"], "margin": "10px 0"}), html.Div("Buy Plan", style={"fontSize": "11px", "color": THEME["accent"], "fontWeight": "600", "marginBottom": "8px"}), metric_line("Entry", fmt_currency_inr(plan["buy_entry"])), metric_line("SL", fmt_currency_inr(plan["buy_sl"])), metric_line("T1", fmt_currency_inr(plan["buy_t1"])), metric_line("T2", fmt_currency_inr(plan["buy_t2"]))])
     ratios_card = style_card([html.Div("Investor Holding View", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), holders_summary(info, holders)])
-    quick_metrics = style_card([html.Div("Quick Technical Data", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("RSI 14", fmt_num(last["RSI14"])), metric_line("MACD", fmt_num(last["MACD"])), metric_line("MACD Signal", fmt_num(last["MACD_SIGNAL"])), metric_line("ADX 14", fmt_num(last["ADX14"])), metric_line("ATR 14", fmt_num(last["ATR14"])), metric_line("Volume", fmt_int(last["Volume"])), metric_line("Volume Avg 20", fmt_int(last["VOL_MA20"])), metric_line("Supertrend", fmt_num(last["SUPERTREND"])),])
-    links = style_card([html.Div("Research Links", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.A("Open Screener", href=screener_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("TradingView", href=f"https://in.tradingview.com/symbols/{make_tv_symbol(symbol).replace(':','-')}/", target="_blank", rel="noopener noreferrer", style=button_link_style()),])
-    news_preview = style_card([html.Div("Latest News Snapshot", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div([html.Div(item.get("title", ""), style={"padding": "10px 0", "borderBottom": f"1px solid {THEME['border']}", "color": THEME['text']}) for item in news_items[:5]]) if news_items else html.Div("No recent news available.", style={"color": THEME["muted"], "marginTop": "10px"}),])
-    return html.Div([top_cards, html.Div(style={"height": "16px"}), company_overview(symbol, company_name, info), html.Div(style={"height": "16px"}), html.Div([signal_card, plan_card, ratios_card, quick_metrics], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(280px,1fr))", "gap": "16px"}), html.Div(style={"height": "16px"}), html.Div([links, news_preview], style={"display": "grid", "gridTemplateColumns": "1fr 1.3fr", "gap": "16px"})])
+    quick_metrics = style_card([html.Div("Quick Technical Data", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("RSI 14", fmt_num(last["RSI14"], decimals=1)), metric_line("MACD", fmt_num(last["MACD"], decimals=4)), metric_line("ADX 14", fmt_num(last["ADX14"], decimals=1)), metric_line("ATR 14", fmt_currency_inr(last["ATR14"]))])
+    links = style_card([html.Div("Research Links", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.A("Open Screener →", href=screener_url(symbol), target="_blank", style=button_link_style()), html.A("NSE Bulk Deals →", href=nse_bulk_url(), target="_blank", style=button_link_style())])
+    news_preview = style_card([html.Div("Latest News Snapshot", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div([html.Div(item.get("publisher", "Source"), style={"fontSize": "11px", "color": THEME["accent"]}), html.Div(item.get("title", "Untitled")[:60], style={"fontSize": "12px", "color": THEME["text"], "marginTop": "2px"}) for item in news_items[:3]], style={"display": "flex", "flexDirection": "column", "gap": "12px"})])
+    return html.Div([top_cards, html.Div(style={"height": "16px"}), company_overview(symbol, company_name, info), html.Div(style={"height": "16px"}), html.Div([signal_card, plan_card, ratios_card, quick_metrics], style={"display": "grid", "gridTemplateColumns": "repeat(2, 1fr)", "gap": "16px"}), html.Div(style={"height": "16px"}), html.Div([links, news_preview], style={"display": "grid", "gridTemplateColumns": "1fr 2fr", "gap": "16px"})])
 
 
 def build_chart_page(symbol, df, indicators):
     fig = make_chart(df, symbol, indicators)
-    controls = style_card([html.Div("Editable Indicators", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Checklist(id="chart-indicator-checklist", options=[{"label": "SMA20", "value": "SMA20"}, {"label": "SMA50", "value": "SMA50"}, {"label": "SMA200", "value": "SMA200"}, {"label": "EMA20", "value": "EMA20"}, {"label": "EMA50", "value": "EMA50"}, {"label": "Bollinger", "value": "Bollinger"}, {"label": "Supertrend", "value": "Supertrend"}, {"label": "MACD", "value": "MACD"}, {"label": "RSI", "value": "RSI"}], value=indicators, inline=True, inputStyle={"marginRight": "6px", "marginLeft": "14px"}, labelStyle={"display": "inline-flex", "alignItems": "center", "marginBottom": "10px", "color": THEME["text"]})])
+    controls = style_card([html.Div("Editable Indicators", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Checklist(id="chart-indicator-checklist", options=[{"label": " SMA20", "value": "SMA20"}, {"label": " SMA50", "value": "SMA50"}, {"label": " SMA200", "value": "SMA200"}, {"label": " EMA20", "value": "EMA20"}, {"label": " EMA50", "value": "EMA50"}, {"label": " Bollinger", "value": "Bollinger"}, {"label": " Supertrend", "value": "Supertrend"}, {"label": " MACD", "value": "MACD"}, {"label": " RSI", "value": "RSI"}], value=indicators, inline=True, style={"display": "grid", "gridTemplateColumns": "repeat(3, 1fr)", "gap": "12px", "color": THEME["text"]})])
     return html.Div([controls, html.Div(style={"height": "14px"}), dcc.Graph(figure=fig, config={"displaylogo": False, "responsive": True})])
 
 
 def build_financials_page(symbol, info, holders, fin_tables):
-    top = html.Div([stat_card("PE Ratio", fmt_num(info.get("trailingPE")), "Trailing PE"), stat_card("PB Ratio", fmt_num(info.get("priceToBook")), "Price to book"), stat_card("ROE", fmt_pct(info.get("returnOnEquity")), "Return on equity"), stat_card("Dividend Yield", fmt_pct(info.get("dividendYield")), "Dividend yield")], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(220px,1fr))", "gap": "16px"})
-    profile = style_card([html.Div("Company Fundamentals", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("Sector", str(info.get("sector", "-"))), metric_line("Industry", str(info.get("industry", "-"))), metric_line("Employees", fmt_int(info.get("fullTimeEmployees"))), metric_line("Enterprise Value", fmt_market_cap(info.get("enterpriseValue"))), metric_line("Book Value", fmt_num(info.get("bookValue"))), metric_line("EPS", fmt_num(info.get("trailingEps"))), metric_line("Beta", fmt_num(info.get("beta"))), metric_line("Profit Margin", fmt_pct(info.get("profitMargins"))),])
-    holders_card = style_card([html.Div("Shareholding Tables", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.H4("Institutional Holders", style={"marginBottom": "10px"}), df_to_table(holders.get("institutional_holders"), rows=8), html.Div(style={"height": "12px"}), html.H4("Mutual Fund Holders", style={"marginBottom": "10px"}), df_to_table(holders.get("mutualfund_holders"), rows=8),])
-    financial_tables = html.Div([style_card([html.H4("Annual Income Statement", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("income_stmt"), rows=12)]), style_card([html.H4("Annual Balance Sheet", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("balance_sheet"), rows=12)]), style_card([html.H4("Annual Cash Flow", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("cashflow"), rows=12)])], style={"display": "grid", "gridTemplateColumns": "1fr", "gap": "16px"})
-    links = style_card([html.Div("External Research", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.A("Open Screener Company Page", href=screener_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style())])
+    top = html.Div([stat_card("PE Ratio", fmt_num(info.get("trailingPE")), "Trailing PE"), stat_card("PB Ratio", fmt_num(info.get("priceToBook")), "Price to book"), stat_card("ROE", fmt_pct(info.get("returnOnEquity"))), stat_card("Debt/Equity", fmt_num(info.get("debtToEquity")))], style={"display": "grid", "gridTemplateColumns": "repeat(4, 1fr)", "gap": "16px"})
+    profile = style_card([html.Div("Company Fundamentals", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("Sector", str(info.get("sector", "-"))), metric_line("Industry", str(info.get("industry", "-"))), metric_line("Market Cap", fmt_market_cap(info.get("marketCap"))), metric_line("Revenue", fmt_market_cap(info.get("totalRevenue")))])
+    holders_card = style_card([html.Div("Shareholding Tables", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.Div([html.H5(name.replace("_", " ").title(), style={"marginTop": "12px", "marginBottom": "8px", "color": THEME["accent"]}), df_to_table(data, rows=5) for name, data in holders.items()], style={"maxHeight": "400px", "overflowY": "auto"})])
+    financial_tables = html.Div([style_card([html.H4("Annual Income Statement", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("income_stmt"), rows=12)]), style_card([html.H4("Annual Balance Sheet", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("balance_sheet"), rows=12)]), style_card([html.H4("Annual Cashflow", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("cashflow"), rows=12)])])
+    links = style_card([html.Div("External Research", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.A("Open Screener →", href=screener_url(symbol), target="_blank", style=button_link_style())])
     return html.Div([top, html.Div(style={"height": "16px"}), html.Div([profile, links], style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"}), html.Div(style={"height": "16px"}), holders_card, html.Div(style={"height": "16px"}), financial_tables])
 
 
 def build_news_page(news_items, symbol):
-    header = style_card([html.Div("News & Order Flow", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(f"Latest news for {symbol}", style={"fontSize": "24px", "fontWeight": "800", "marginTop": "10px"}), html.Div("Bulk or block deal discovery is provided through NSE and Moneycontrol links, while recent feed items appear below.", style={"marginTop": "8px", "color": THEME["muted"]}), html.Div(style={"marginTop": "12px"}, children=[html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style())])])
+    header = style_card([html.Div("News & Order Flow", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(f"Latest news for {symbol}", style={"fontSize": "18px", "fontWeight": "600", "color": THEME["text"], "marginTop": "8px"})])
     return html.Div([header, html.Div(style={"height": "16px"}), build_news_cards(news_items)])
 
 
@@ -613,7 +645,9 @@ def build_tab_content(tab, symbol, company_name, info, df, signal, score, confid
 try:
     STOCKS_DF = load_nse_stocks()
     DROPDOWN_OPTIONS = [{"label": f"{r['SYMBOL']} - {r['NAME OF COMPANY']}", "value": r["SYMBOL"]} for _, r in STOCKS_DF.iterrows()]
-except Exception:
+    logger.info(f"Loaded {len(DROPDOWN_OPTIONS)} stocks for dropdown")
+except Exception as e:
+    logger.error(f"Failed to load NSE stocks: {e}")
     STOCKS_DF = pd.DataFrame(columns=["SYMBOL", "NAME OF COMPANY"])
     DROPDOWN_OPTIONS = []
 
@@ -625,7 +659,8 @@ def _scan_one(symbol, company):
         sig, score, conf, _ = generate_signal(hist)
         last = hist.iloc[-1]
         return {"symbol": symbol, "company": company, "signal": sig, "confidence": conf, "close": round(float(last["Close"]), 2), "rsi": round(float(last["RSI14"]), 2) if pd.notna(last["RSI14"]) else None}
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Scan failed for {symbol}: {e}")
         return None
 
 
@@ -634,6 +669,7 @@ def build_scan_universe_cached(limit=TOP_SCAN_LIMIT):
     rows = []
     sample = STOCKS_DF.head(limit)
     workers = min(12, max(4, len(sample) // 20 if len(sample) else 4))
+    logger.info(f"Starting scan of {len(sample)} stocks with {workers} workers")
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(_scan_one, row["SYMBOL"], row["NAME OF COMPANY"]) for _, row in sample.iterrows()]
         for future in as_completed(futures):
@@ -642,15 +678,20 @@ def build_scan_universe_cached(limit=TOP_SCAN_LIMIT):
                 rows.append(result)
     scan_df = pd.DataFrame(rows)
     if scan_df.empty:
+        logger.warning("Scan resulted in no data")
         return scan_df
     order = {"STRONG BUY": 5, "BUY": 4, "HOLD": 3, "NIL": 2, "SELL": 1, "STRONG SELL": 0}
     scan_df["rank"] = scan_df["signal"].map(order).fillna(0)
-    return scan_df.sort_values(["rank", "confidence"], ascending=[False, False]).drop(columns=["rank"])
+    result = scan_df.sort_values(["rank", "confidence"], ascending=[False, False]).drop(columns=["rank"])
+    logger.info(f"Scan complete: {len(result)} stocks processed")
+    return result
 
 
 try:
     SCAN_DF = build_scan_universe_cached(TOP_SCAN_LIMIT)
-except Exception:
+    logger.info(f"Scanner initialized with {len(SCAN_DF)} stocks")
+except Exception as e:
+    logger.error(f"Failed to build scan universe: {e}")
     SCAN_DF = pd.DataFrame(columns=["symbol", "company", "signal", "confidence", "close", "rsi"])
 
 DEFAULT_INDICATORS = ["SMA20", "SMA50", "SMA200", "Bollinger", "Supertrend", "MACD", "RSI"]
@@ -659,14 +700,15 @@ app.layout = html.Div([
     dcc.Store(id="selected-symbol-store", data=DEFAULT_SYMBOL),
     dcc.Store(id="selected-indicators-store", data=DEFAULT_INDICATORS),
     html.Div([
-        html.Div([html.Div("BLAST NSE LAB PRO", style={"fontSize": "12px", "letterSpacing": "2px", "color": THEME["accent"], "fontWeight": "800"}), html.H1("Dark Theme Stock Dashboard", style={"margin": "8px 0 4px 0", "fontSize": "34px"}), html.Div("Cleaner watchlist, stronger visibility, quick stock intelligence, chart lab, financials and live news in one screen.", style={"color": THEME["muted"], "maxWidth": "900px", "lineHeight": "1.7"})]),
+        html.Div([html.Div("BLAST NSE LAB PRO", style={"fontSize": "12px", "letterSpacing": "2px", "color": THEME["accent"], "fontWeight": "800"}), html.H1("Dark Theme Stock Dashboard", style={"margin": "0", "fontSize": "42px", "fontWeight": "900", "color": THEME["text"], "marginTop": "8px"})], style={"marginBottom": "8px"}),
         html.Div(style={"height": "20px"}),
         html.Div([
-            style_card([html.Div("Stock Search", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Dropdown(id="stock-dropdown", options=DROPDOWN_OPTIONS, value=DEFAULT_SYMBOL if DEFAULT_SYMBOL in [o["value"] for o in DROPDOWN_OPTIONS] else None, placeholder="Search stock symbol or company name", searchable=True, clearable=False, style={"color": "#111827"}), html.Div(id="selected-stock-title", style={"marginTop": "12px", "color": THEME["text"], "fontWeight": "700"})]),
-            style_card([html.Div("Smart Technical Scanner", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Dropdown(id="signal-filter-dropdown", options=[{"label": "All", "value": "ALL"}, {"label": "Strong Buy", "value": "STRONG BUY"}, {"label": "Buy", "value": "BUY"}, {"label": "Hold", "value": "HOLD"}, {"label": "Nil", "value": "NIL"}, {"label": "Sell", "value": "SELL"}, {"label": "Strong Sell", "value": "STRONG SELL"}], value="ALL", clearable=False, style={"color": "#111827"}), html.Div(id="scanner-table-container", style={"marginTop": "12px"})]),
+            style_card([html.Div("Stock Search", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Dropdown(id="stock-dropdown", options=DROPDOWN_OPTIONS, value=DEFAULT_SYMBOL, clearable=False, style={"color": THEME["text"]})]),
+            style_card([html.Div("Smart Technical Scanner", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Dropdown(id="signal-filter-dropdown", options=[{"label": "All Signals", "value": "ALL"}, {"label": "Strong Buy", "value": "STRONG BUY"}, {"label": "Buy", "value": "BUY"}, {"label": "Hold", "value": "HOLD"}, {"label": "Sell", "value": "SELL"}], value="ALL", clearable=False)])
         ], style={"display": "grid", "gridTemplateColumns": "0.95fr 1.35fr", "gap": "16px"}),
         html.Div(style={"height": "18px"}),
-        dcc.Tabs(id="main-tabs", value="home", parent_className="custom-tabs", className="custom-tabs-container", children=[dcc.Tab(label="Home", value="home", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Chart", value="chart", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Financials", value="financials", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="News", value="news", className="custom-tab", selected_className="custom-tab--selected")]),
+        html.Div(id="selected-stock-title", style={"fontSize": "16px", "color": THEME["accent"], "fontWeight": "600", "marginBottom": "12px"}),
+        dcc.Tabs(id="main-tabs", value="home", parent_className="custom-tabs", className="custom-tabs-container", children=[dcc.Tab(label="Home", value="home", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Chart", value="chart", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Financials", value="financials", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="News", value="news", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Scanner", value="scanner", className="custom-tab", selected_className="custom-tab--selected", children=[html.Div(id="scanner-table-container", style={"marginTop": "18px"})])]),
         html.Div(id="main-tab-content", style={"marginTop": "18px"}),
     ], style={"maxWidth": "1450px", "margin": "0 auto", "padding": "28px 18px 60px 18px"})
 ], style={"minHeight": "100vh", "background": f"radial-gradient(circle at top left, {THEME['bg3']}, {THEME['bg']})", "color": THEME["text"], "fontFamily": "Inter, Segoe UI, Arial, sans-serif"})
@@ -683,7 +725,8 @@ app.index_string = """
             body { background: #0b1220; }
             .custom-tabs-container { width: 100%; }
             .custom-tabs { background: #121c2d; border: 1px solid #26354f; border-radius: 16px; padding: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
-            .custom-tab { color: #9fb0c8 !important; background: #172235 !important; border: 1px solid #26354f !important; border-radius: 12px !important; padding: 12px 18px !important; font-weight: 700; }
+            .custom-tab { color: #9fb0c8 !important; background: #172235 !important; border: 1px solid #26354f !important; border-radius: 12px !important; padding: 12px 18px !important; font-weight: 700 !important; cursor: pointer; transition: all 0.2s; }
+            .custom-tab:hover { border-color: #3a5277 !important; }
             .custom-tab--selected { color: #e6edf7 !important; background: linear-gradient(180deg, #1f3150, #172235) !important; border: 1px solid #3a5277 !important; }
             @media (max-width: 900px) { .custom-tabs { display:block; } }
         </style>
@@ -716,10 +759,12 @@ def sync_indicator_store(values):
 @app.callback(Output("scanner-table-container", "children"), Input("signal-filter-dropdown", "value"))
 def render_scanner(signal_value):
     if SCAN_DF.empty:
-        return html.Div("Scanner data is not available right now.", style={"color": THEME["muted"]})
+        return html.Div("Scanner data is not available right now. Please refresh.", style={"color": THEME["muted"]})
     df = SCAN_DF.copy()
     if signal_value and signal_value != "ALL":
         df = df[df["signal"] == signal_value]
+    if df.empty:
+        return html.Div(f"No stocks found with signal '{signal_value}'", style={"color": THEME["muted"]})
     show = df.head(20).copy()
     return dash_table.DataTable(
         data=show.to_dict("records"),
@@ -753,8 +798,10 @@ def render_main_content(tab, symbol, indicators):
         signal, score, confidence, reasons = generate_signal(df, info=info, news_count=len(news_items), deals_bias=0)
         return build_tab_content(tab, symbol, company_name, info, df, signal, score, confidence, reasons, news_items, holders, fin_tables, indicators)
     except Exception as e:
-        return style_card([html.Div("Data Error", style={"fontSize": "22px", "fontWeight": "800", "color": THEME["danger"]}), html.Div(str(e), style={"marginTop": "10px", "color": THEME["text"], "lineHeight": "1.7"})])
+        logger.error(f"Error rendering content for {symbol}: {e}", exc_info=True)
+        return style_card([html.Div("⚠️ Data Error", style={"fontSize": "22px", "fontWeight": "800", "color": THEME["danger"]}), html.Div(f"Unable to load data: {str(e)[:100]}", style={"marginTop": "10px", "color": THEME["text"], "lineHeight": "1.4", "fontSize": "13px"}), html.Div("Try selecting a different stock or refreshing the page.", style={"marginTop": "10px", "fontSize": "12px", "color": THEME["muted"]})])
 
 
 if __name__ == "__main__":
+    logger.info("Starting Dash application...")
     app.run(debug=True, host="127.0.0.1", port=8050)
