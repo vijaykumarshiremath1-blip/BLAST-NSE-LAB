@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 
 NSE_EQUITY_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 DEFAULT_SYMBOL = "RELIANCE"
-TOP_SCAN_LIMIT = 220
+TOP_SCAN_LIMIT = 40
 LOOKBACK_DAYS = 260
 NSE_HOME = "https://www.nseindia.com"
 NSE_REPORTS_URL = "https://www.nseindia.com/all-reports"
@@ -294,4 +294,4 @@ def adx(df, period=14):
 def supertrend(df, period=10, multiplier=3):
     hl2 = (df["High"] + df["Low"]) / 2
     atr_val = atr(df, period)
-  
+   
