@@ -247,31 +247,223 @@ def nearest_levels(df, lookback=40):
     return support, resistance
 
 
-def generate_signal(df, info=None, news_count=0, deals_bias=0):
+def normalize_score(value, cap=100.0):
+    try:
+        v = float(value)
+        return max(-1.0, min(1.0, v / cap))
+    except Exception:
+        return 0.0
+
+
+def safe_float(value, default=np.nan):
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_pct(value, default=np.nan):
+    try:
+        if value is None or pd.isna(value):
+            return default
+        v = float(value)
+        return v * 100 if abs(v) <= 1 else v
+    except Exception:
+        return default
+
+
+def calc_vwap(df):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    vol = df["Volume"].replace(0, np.nan)
+    return (tp * vol).cumsum() / vol.cumsum()
+
+
+def calc_intraday_features(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else last
+    vwap = calc_vwap(df)
+    vwap_last = vwap.iloc[-1]
+    day_range = max(float(last["High"] - last["Low"]), 1e-9)
+    close_pos = float((last["Close"] - last["Low"]) / day_range)
+    gap_pct = ((float(last["Open"]) - float(prev["Close"])) / float(prev["Close"]) * 100) if float(prev["Close"]) else 0.0
+    body_pct = abs(float(last["Close"] - last["Open"])) / max(float(last["Open"]), 1e-9) * 100
+    return {
+        "vwap": safe_float(vwap_last),
+        "vwap_dist_pct": ((float(last["Close"]) - float(vwap_last)) / float(vwap_last) * 100) if pd.notna(vwap_last) and float(vwap_last) else np.nan,
+        "gap_pct": gap_pct,
+        "close_pos": close_pos,
+        "body_pct": body_pct,
+        "range_pct": (day_range / float(last["Close"]) * 100) if float(last["Close"]) else np.nan,
+        "vol_spike": (float(last["Volume"]) / float(last["VOL_MA20"])) if pd.notna(last["VOL_MA20"]) and float(last["VOL_MA20"]) else np.nan,
+    }
+
+
+def calc_fundamental_score(info, df):
+    score = 0
+    reasons = []
+    pe = safe_float(info.get("trailingPE"))
+    pb = safe_float(info.get("priceToBook"))
+    roe = safe_pct(info.get("returnOnEquity"))
+    profit_margin = safe_pct(info.get("profitMargins"))
+    revenue_growth = safe_pct(info.get("revenueGrowth"))
+    debt_to_equity = safe_float(info.get("debtToEquity"))
+    current_ratio = safe_float(info.get("currentRatio"))
+    market_cap = safe_float(info.get("marketCap"))
+
+    if pd.notna(roe):
+        if roe >= 15:
+            score += 2
+            reasons.append("ROE is strong")
+        elif roe <= 8:
+            score -= 1
+            reasons.append("ROE is weak")
+    if pd.notna(profit_margin):
+        if profit_margin >= 10:
+            score += 1
+            reasons.append("Profit margin is healthy")
+        elif profit_margin <= 5:
+            score -= 1
+            reasons.append("Profit margin is thin")
+    if pd.notna(revenue_growth):
+        if revenue_growth >= 10:
+            score += 2
+            reasons.append("Revenue growth is supportive")
+        elif revenue_growth <= 0:
+            score -= 1
+            reasons.append("Revenue growth is negative")
+    if pd.notna(pe):
+        if 0 < pe <= 25:
+            score += 1
+            reasons.append("PE is reasonable")
+        elif pe > 50:
+            score -= 1
+            reasons.append("PE is expensive")
+    if pd.notna(pb):
+        if 0 < pb <= 5:
+            score += 1
+            reasons.append("PB is acceptable")
+        elif pb > 10:
+            score -= 1
+            reasons.append("PB is stretched")
+    if pd.notna(debt_to_equity) and debt_to_equity > 200:
+        score -= 1
+        reasons.append("Leverage is elevated")
+    if pd.notna(current_ratio) and current_ratio >= 1.2:
+        score += 1
+        reasons.append("Liquidity profile is acceptable")
+    if pd.notna(market_cap) and market_cap > 0:
+        score += 0
+
+    if len(df) >= 200:
+        last = df.iloc[-1]
+        if pd.notna(last.get("SMA200")):
+            if last["Close"] > last["SMA200"]:
+                score += 1
+                reasons.append("Price above long-term trend")
+            else:
+                score -= 1
+                reasons.append("Price below long-term trend")
+
+    return score, reasons[:5]
+
+
+def calc_order_flow_score(symbol, info=None):
+    score = 0
+    reasons = []
+    # Hook points for live feeds / APIs / scraping. Fallback is neutral if unavailable.
+    bulk_deal_signal = safe_float(info.get("bulkDealSignal")) if info else np.nan
+    block_deal_signal = safe_float(info.get("blockDealSignal")) if info else np.nan
+    oi_change = safe_float(info.get("oiChangePct")) if info else np.nan
+    fii_change = safe_float(info.get("fiiChangePct")) if info else np.nan
+    dii_change = safe_float(info.get("diiChangePct")) if info else np.nan
+    insider_flag = str(info.get("insiderSignal", "")).lower() if info else ""
+
+    if pd.notna(bulk_deal_signal):
+        score += int(np.clip(bulk_deal_signal, -2, 2))
+        reasons.append("Bulk deal activity detected")
+    if pd.notna(block_deal_signal):
+        score += int(np.clip(block_deal_signal, -2, 2))
+        reasons.append("Block deal activity detected")
+    if pd.notna(oi_change):
+        if oi_change >= 10:
+            score += 2
+            reasons.append("OI change supports fresh position buildup")
+        elif oi_change <= -10:
+            score -= 1
+            reasons.append("OI change is weakening")
+    if pd.notna(fii_change) and fii_change > 0:
+        score += 1
+        reasons.append("FII activity supportive")
+    if pd.notna(dii_change) and dii_change > 0:
+        score += 1
+        reasons.append("DII activity supportive")
+    if insider_flag in {"buy", "positive", "accumulation", "open_market_buy"}:
+        score += 2
+        reasons.append("Insider signal supportive")
+    elif insider_flag in {"sell", "negative", "distribution", "open_market_sell"}:
+        score -= 2
+        reasons.append("Insider signal negative")
+
+    return score, reasons[:5]
+
+
+def calc_news_score(news_items):
+    score = 0
+    reasons = []
+    if not news_items:
+        return score, reasons
+    recent_positive = 0
+    recent_negative = 0
+    for item in news_items[:15]:
+        blob = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+        if any(k in blob for k in ["order win", "results", "profit", "expansion", "approval", "upgrade", "buyback", "dividend", "acquisition"]):
+            recent_positive += 1
+        if any(k in blob for k in ["loss", "downgrade", "fraud", "probe", "ban", "penalty", "resign", "selloff", "warning"]):
+            recent_negative += 1
+    if recent_positive:
+        score += min(2, recent_positive)
+        reasons.append("Positive corporate news flow")
+    if recent_negative:
+        score -= min(2, recent_negative)
+        reasons.append("Negative headline risk")
+    return score, reasons[:3]
+
+
+def calc_technical_score(df):
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else last
     score = 0
     reasons = []
-    if pd.notna(last["SMA20"]) and pd.notna(last["SMA50"]):
-        if last["Close"] > last["SMA20"] > last["SMA50"]:
-            score += 2
-            reasons.append("Price above SMA20 and SMA50")
-        elif last["Close"] < last["SMA20"] < last["SMA50"]:
-            score -= 2
-            reasons.append("Price below SMA20 and SMA50")
+
+    if pd.notna(last["SMA20"]) and pd.notna(last["SMA50"]) and pd.notna(last["EMA20"]):
+        if last["Close"] > last["EMA20"] > last["SMA20"] > last["SMA50"]:
+            score += 3
+            reasons.append("Strong short-term trend alignment")
+        elif last["Close"] < last["EMA20"] < last["SMA20"] < last["SMA50"]:
+            score -= 3
+            reasons.append("Weak short-term trend alignment")
+
     if pd.notna(last["SMA50"]) and pd.notna(last["SMA200"]):
         if last["SMA50"] > last["SMA200"]:
+            score += 2
+            reasons.append("Medium-term trend is bullish")
+        else:
+            score -= 2
+            reasons.append("Medium-term trend is bearish")
+
+    if pd.notna(last["RSI14"]):
+        if 55 <= last["RSI14"] <= 70:
             score += 1
-            reasons.append("SMA50 above SMA200")
-        elif last["SMA50"] < last["SMA200"]:
+            reasons.append("RSI supports momentum")
+        elif last["RSI14"] < 35:
+            score += 1
+            reasons.append("RSI may be oversold")
+        elif last["RSI14"] > 75:
             score -= 1
-            reasons.append("SMA50 below SMA200")
-    if last["RSI14"] > 60:
-        score += 1
-        reasons.append("RSI above 60")
-    elif last["RSI14"] < 40:
-        score -= 1
-        reasons.append("RSI below 40")
+            reasons.append("RSI is overheated")
+
     if last["MACD"] > last["MACD_SIGNAL"] and prev["MACD"] <= prev["MACD_SIGNAL"]:
         score += 2
         reasons.append("Fresh MACD bullish crossover")
@@ -280,57 +472,107 @@ def generate_signal(df, info=None, news_count=0, deals_bias=0):
         reasons.append("Fresh MACD bearish crossover")
     elif last["MACD"] > last["MACD_SIGNAL"]:
         score += 1
-        reasons.append("MACD above signal")
+        reasons.append("MACD remains bullish")
     else:
         score -= 1
-        reasons.append("MACD below signal")
-    if pd.notna(last["VOL_MA20"]) and last["Volume"] > last["VOL_MA20"]:
-        score += 1
-        reasons.append("Volume above 20-day average")
-    if last.get("ST_DIR") == "Bullish":
-        score += 1
-        reasons.append("Supertrend bullish")
-    elif last.get("ST_DIR") == "Bearish":
-        score -= 1
-        reasons.append("Supertrend bearish")
+        reasons.append("MACD remains weak")
+
     if pd.notna(last["ADX14"]):
         if last["ADX14"] >= 25:
             score += 1
-            reasons.append("ADX trend strength above 25")
-        else:
-            reasons.append("ADX indicates moderate trend")
-    if info:
-        rec = str(info.get("recommendationKey", "")).lower()
-        if rec in {"buy", "strong_buy", "outperform"}:
+            reasons.append("Trend strength is solid")
+        elif last["ADX14"] < 15:
+            reasons.append("Trend strength is muted")
+
+    if pd.notna(last["VOL_MA20"]) and float(last["VOL_MA20"]) > 0:
+        vol_ratio = float(last["Volume"]) / float(last["VOL_MA20"])
+        if vol_ratio >= 1.5:
+            score += 2
+            reasons.append("Volume expansion is strong")
+        elif vol_ratio >= 1.1:
             score += 1
-            reasons.append("Analyst recommendation supportive")
-        elif rec in {"sell", "underperform"}:
+            reasons.append("Volume is above average")
+        elif vol_ratio < 0.7:
             score -= 1
-            reasons.append("Analyst recommendation weak")
-        if info.get("heldPercentInstitutions") not in (None, ""):
-            if float(info.get("heldPercentInstitutions", 0) or 0) > 0.15:
-                score += 1
-                reasons.append("Institutional holding present")
-    if news_count >= 5:
+            reasons.append("Volume is weak")
+
+    if last.get("ST_DIR") == "Bullish":
         score += 1
-        reasons.append("Healthy recent news flow")
-    score += deals_bias
-    if deals_bias > 0:
-        reasons.append("Deal flow supportive")
-    if score >= 6:
+        reasons.append("Supertrend is bullish")
+    elif last.get("ST_DIR") == "Bearish":
+        score -= 1
+        reasons.append("Supertrend is bearish")
+
+    intraday = calc_intraday_features(df)
+    if pd.notna(intraday["vwap_dist_pct"]):
+        if intraday["vwap_dist_pct"] > 0.5:
+            score += 1
+            reasons.append("Price is above VWAP")
+        elif intraday["vwap_dist_pct"] < -0.5:
+            score -= 1
+            reasons.append("Price is below VWAP")
+    if intraday["close_pos"] >= 0.75:
+        score += 1
+        reasons.append("Strong close near day high")
+    elif intraday["close_pos"] <= 0.25:
+        score -= 1
+        reasons.append("Weak close near day low")
+    if pd.notna(intraday["vol_spike"]) and intraday["vol_spike"] >= 2:
+        score += 1
+        reasons.append("Intraday volume spike detected")
+
+    return score, reasons[:8], intraday
+
+
+def evaluate_stock_quality(df, info, news_items, symbol):
+    technical_score, technical_reasons, intraday = calc_technical_score(df)
+    fundamental_score, fundamental_reasons = calc_fundamental_score(info, df)
+    flow_score, flow_reasons = calc_order_flow_score(symbol, info)
+    news_score, news_reasons = calc_news_score(news_items)
+
+    total = technical_score + fundamental_score + flow_score + news_score
+    reasons = []
+    reasons.extend(technical_reasons)
+    reasons.extend(fundamental_reasons)
+    reasons.extend(flow_reasons)
+    reasons.extend(news_reasons)
+
+    return total, reasons[:10], {
+        "technical_score": technical_score,
+        "fundamental_score": fundamental_score,
+        "flow_score": flow_score,
+        "news_score": news_score,
+        "intraday": intraday,
+    }
+
+
+def generate_signal(df, info=None, news_count=0, deals_bias=0, news_items=None, symbol=None):
+    if news_items is None:
+        news_items = []
+    total_score, reasons, parts = evaluate_stock_quality(df, info or {}, news_items, symbol or "")
+
+    if deals_bias:
+        total_score += deals_bias
+        if deals_bias > 0:
+            reasons.append("Deal flow is supportive")
+        elif deals_bias < 0:
+            reasons.append("Deal flow is weak")
+
+    if total_score >= 8:
         signal = "STRONG BUY"
-    elif score >= 3:
+    elif total_score >= 4:
         signal = "BUY"
-    elif score <= -6:
+    elif total_score <= -8:
         signal = "STRONG SELL"
-    elif score <= -3:
+    elif total_score <= -4:
         signal = "SELL"
-    elif abs(score) <= 1:
+    elif abs(total_score) <= 1:
         signal = "NIL"
     else:
         signal = "HOLD"
-    confidence = min(97, max(38, 48 + abs(score) * 7))
-    return signal, score, confidence, reasons[:6]
+
+    confidence = min(99, max(35, 50 + abs(total_score) * 5))
+    return signal, total_score, confidence, reasons[:8], parts
 
 
 def get_company_name(symbol, stocks_df):
@@ -479,18 +721,31 @@ def nse_bulk_url():
 
 
 def style_card(children, height=None):
-    style = {"background": f"linear-gradient(180deg, {THEME['panel2']}, {THEME['panel']})", "border": f"1px solid {THEME['border']}", "borderRadius": "18px", "padding": "18px", "boxShadow": "0 12px 28px rgba(0,0,0,0.28)"}
+    style = {
+        "background": f"linear-gradient(180deg, {THEME['panel2']}, {THEME['panel']})",
+        "border": f"1px solid {THEME['border']}",
+        "borderRadius": "18px",
+        "padding": "18px",
+        "boxShadow": "0 12px 28px rgba(0,0,0,0.28)",
+    }
     if height:
         style["minHeight"] = height
     return html.Div(children, style=style)
 
 
 def stat_card(title, value, sub=None, color=None):
-    return style_card([html.Div(title, style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(value, style={"color": color or THEME["text"], "fontSize": "26px", "fontWeight": "800", "marginTop": "10px"}), html.Div(sub or "", style={"color": THEME["faint"], "fontSize": "13px", "marginTop": "8px"})], height="118px")
+    return style_card([
+        html.Div(title, style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+        html.Div(value, style={"color": color or THEME["text"], "fontSize": "26px", "fontWeight": "800", "marginTop": "10px"}),
+        html.Div(sub or "", style={"color": THEME["faint"], "fontSize": "13px", "marginTop": "8px"}),
+    ], height="118px")
 
 
 def metric_line(label, value):
-    return html.Div([html.Span(label, style={"color": THEME["muted"]}), html.Strong(value, style={"color": THEME["text"]})], style={"display": "flex", "justifyContent": "space-between", "padding": "10px 0", "borderBottom": f"1px solid {THEME['border']}"})
+    return html.Div(
+        [html.Span(label, style={"color": THEME["muted"]}), html.Strong(value, style={"color": THEME["text"]})],
+        style={"display": "flex", "justifyContent": "space-between", "padding": "10px 0", "borderBottom": f"1px solid {THEME['border']}"},
+    )
 
 
 def make_chart(df, symbol, indicators):
@@ -544,13 +799,22 @@ def holders_summary(info, holders):
     if isinstance(major, pd.DataFrame) and major.shape[1] >= 2:
         for _, row in major.iterrows():
             major_map[str(row.iloc[1])] = row.iloc[0]
-    rows = [("FII / Institutional", fmt_pct(info.get("heldPercentInstitutions")) if info else "-"), ("Promoters / Insiders", fmt_pct(info.get("heldPercentInsiders")) if info else "-"), ("Mutual Funds", major_map.get("% of Shares Held by Institutions", "-")), ("Retail / Public", "Check detailed shareholding in Screener / annual filing")]
+    rows = [
+        ("FII / Institutional", fmt_pct(info.get("heldPercentInstitutions")) if info else "-"),
+        ("Promoters / Insiders", fmt_pct(info.get("heldPercentInsiders")) if info else "-"),
+        ("Mutual Funds", major_map.get("% of Shares Held by Institutions", "-")),
+        ("Retail / Public", "Check detailed shareholding in Screener / annual filing"),
+    ]
     return html.Div([metric_line(a, b) for a, b in rows])
 
 
 def company_overview(symbol, company_name, info):
     summary = info.get("longBusinessSummary") or info.get("description") or "Business summary not available."
-    return style_card([html.Div(f"{company_name} ({symbol})", style={"fontSize": "24px", "fontWeight": "800", "color": THEME["text"]}), html.Div(f"{info.get('sector', '-')} • {info.get('industry', '-')}", style={"marginTop": "6px", "color": THEME["muted"]}), html.P(summary[:900], style={"marginTop": "14px", "color": THEME["text"], "lineHeight": "1.7"})])
+    return style_card([
+        html.Div(f"{company_name} ({symbol})", style={"fontSize": "24px", "fontWeight": "800", "color": THEME["text"]}),
+        html.Div(f"{info.get('sector', '-')} • {info.get('industry', '-')}", style={"marginTop": "6px", "color": THEME["muted"]}),
+        html.P(summary[:900], style={"marginTop": "14px", "color": THEME["text"], "lineHeight": "1.7"}),
+    ])
 
 
 def build_news_cards(news_items):
@@ -558,7 +822,12 @@ def build_news_cards(news_items):
         return style_card(html.Div("No recent news available from Yahoo feed.", style={"color": THEME["muted"]}))
     cards = []
     for item in news_items[:10]:
-        cards.append(style_card([html.Div(item.get("publisher", "Source"), style={"color": THEME["accent"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.A(item.get("title", "Untitled"), href=item.get("link") or None, target="_blank", rel="noopener noreferrer", style={"display": "block", "marginTop": "8px", "color": THEME["text"], "fontWeight": "800", "textDecoration": "none", "fontSize": "17px"}), html.Div(item.get("summary", "")[:240], style={"marginTop": "8px", "color": THEME["muted"], "lineHeight": "1.6"}), html.Div(str(item.get("published", "")), style={"marginTop": "10px", "color": THEME["faint"], "fontSize": "12px"})]))
+        cards.append(style_card([
+            html.Div(item.get("publisher", "Source"), style={"color": THEME["accent"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+            html.A(item.get("title", "Untitled"), href=item.get("link") or None, target="_blank", rel="noopener noreferrer", style={"display": "block", "marginTop": "8px", "color": THEME["text"], "fontWeight": "800", "textDecoration": "none", "fontSize": "17px"}),
+            html.Div(item.get("summary", "")[:240], style={"marginTop": "8px", "color": THEME["muted"], "lineHeight": "1.6"}),
+            html.Div(str(item.get("published", "")), style={"marginTop": "10px", "color": THEME["faint"], "fontSize": "12px"}),
+        ]))
     return html.Div(cards, style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(280px,1fr))", "gap": "16px"})
 
 
@@ -570,33 +839,109 @@ def build_home_page(symbol, company_name, info, df, signal, score, confidence, r
     snap = price_snapshot(df, info)
     plan = order_plan(df)
     last = df.iloc[-1]
-    top_cards = html.Div([stat_card("Last Close", fmt_currency_inr(snap["close"]), f"{snap['change']} ({snap['change_pct']}%)", THEME["good"] if snap["change"] >= 0 else THEME["danger"]), stat_card("Day Range", f"₹ {fmt_num(snap['low'])} - ₹ {fmt_num(snap['high'])}", "Day low / high"), stat_card("52 Week Range", f"₹ {fmt_num(snap['low_52'])} - ₹ {fmt_num(snap['high_52'])}", "52-week low / high"), stat_card("Market Cap", fmt_market_cap(info.get("marketCap")), info.get("exchange", "NSE"))], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(220px,1fr))", "gap": "16px"})
-    signal_card = style_card([html.Div("Technical + Flow Signal", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(signal, style={"fontSize": "32px", "fontWeight": "900", "marginTop": "10px", "color": SIGNAL_COLORS.get(signal, THEME['text'])}), html.Div(f"Score: {score}   |   Confidence: {confidence}%", style={"color": THEME["text"], "marginTop": "8px"}), html.Ul([html.Li(r) for r in reasons], style={"marginTop": "12px", "paddingLeft": "18px", "color": THEME["muted"], "lineHeight": "1.8"})])
-    plan_card = style_card([html.Div("Trade Plan", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("Support", fmt_currency_inr(plan["support"])), metric_line("Resistance", fmt_currency_inr(plan["resistance"])), metric_line("Buy Entry", fmt_currency_inr(plan["buy_entry"])), metric_line("Buy Stop Loss", fmt_currency_inr(plan["buy_sl"])), metric_line("Buy Target 1", fmt_currency_inr(plan["buy_t1"])), metric_line("Buy Target 2", fmt_currency_inr(plan["buy_t2"])),])
+    top_cards = html.Div([
+        stat_card("Last Close", fmt_currency_inr(snap["close"]), f"{snap['change']} ({snap['change_pct']}%)", THEME["good"] if snap["change"] >= 0 else THEME["danger"]),
+        stat_card("Day Range", f"₹ {fmt_num(snap['low'])} - ₹ {fmt_num(snap['high'])}", "Day low / high"),
+        stat_card("52 Week Range", f"₹ {fmt_num(snap['low_52'])} - ₹ {fmt_num(snap['high_52'])}", "52-week low / high"),
+        stat_card("Market Cap", fmt_market_cap(info.get("marketCap")), info.get("exchange", "NSE")),
+    ], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(220px,1fr))", "gap": "16px"})
+    signal_card = style_card([
+        html.Div("Technical + Flow Signal", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+        html.Div(signal, style={"fontSize": "32px", "fontWeight": "900", "marginTop": "10px", "color": SIGNAL_COLORS.get(signal, THEME["text"])}),
+        html.Div(f"Score: {score}   |   Confidence: {confidence}%", style={"color": THEME["text"], "marginTop": "8px"}),
+        html.Ul([html.Li(r) for r in reasons], style={"marginTop": "12px", "paddingLeft": "18px", "color": THEME["muted"], "lineHeight": "1.8"}),
+    ])
+    plan_card = style_card([
+        html.Div("Trade Plan", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+        metric_line("Support", fmt_currency_inr(plan["support"])),
+        metric_line("Resistance", fmt_currency_inr(plan["resistance"])),
+        metric_line("Buy Entry", fmt_currency_inr(plan["buy_entry"])),
+        metric_line("Buy Stop Loss", fmt_currency_inr(plan["buy_sl"])),
+        metric_line("Buy Target 1", fmt_currency_inr(plan["buy_t1"])),
+        metric_line("Buy Target 2", fmt_currency_inr(plan["buy_t2"])),
+    ])
     ratios_card = style_card([html.Div("Investor Holding View", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), holders_summary(info, holders)])
-    quick_metrics = style_card([html.Div("Quick Technical Data", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("RSI 14", fmt_num(last["RSI14"])), metric_line("MACD", fmt_num(last["MACD"])), metric_line("MACD Signal", fmt_num(last["MACD_SIGNAL"])), metric_line("ADX 14", fmt_num(last["ADX14"])), metric_line("ATR 14", fmt_num(last["ATR14"])), metric_line("Volume", fmt_int(last["Volume"])), metric_line("Volume Avg 20", fmt_int(last["VOL_MA20"])), metric_line("Supertrend", fmt_num(last["SUPERTREND"])),])
-    links = style_card([html.Div("Research Links", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.A("Open Screener", href=screener_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("TradingView", href=f"https://in.tradingview.com/symbols/{make_tv_symbol(symbol).replace(':','-')}/", target="_blank", rel="noopener noreferrer", style=button_link_style()),])
-    news_preview = style_card([html.Div("Latest News Snapshot", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div([html.Div(item.get("title", ""), style={"padding": "10px 0", "borderBottom": f"1px solid {THEME['border']}", "color": THEME['text']}) for item in news_items[:5]]) if news_items else html.Div("No recent news available.", style={"color": THEME["muted"], "marginTop": "10px"}),])
+    quick_metrics = style_card([
+        html.Div("Quick Technical Data", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+        metric_line("RSI 14", fmt_num(last["RSI14"])),
+        metric_line("MACD", fmt_num(last["MACD"])),
+        metric_line("MACD Signal", fmt_num(last["MACD_SIGNAL"])),
+        metric_line("ADX 14", fmt_num(last["ADX14"])),
+        metric_line("ATR 14", fmt_num(last["ATR14"])),
+        metric_line("Volume", fmt_int(last["Volume"])),
+        metric_line("Volume Avg 20", fmt_int(last["VOL_MA20"])),
+        metric_line("Supertrend", fmt_num(last["SUPERTREND"])),
+    ])
+    links = style_card([
+        html.Div("Research Links", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}),
+        html.A("Open Screener", href=screener_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()),
+        html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()),
+        html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()),
+        html.A("TradingView", href=f"https://in.tradingview.com/symbols/{make_tv_symbol(symbol).replace(':','-')}/", target="_blank", rel="noopener noreferrer", style=button_link_style()),
+    ])
+    news_preview = style_card([
+        html.Div("Latest News Snapshot", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+        html.Div([html.Div(item.get("title", ""), style={"padding": "10px 0", "borderBottom": f"1px solid {THEME['border']}", "color": THEME["text"]}) for item in news_items[:5]]) if news_items else html.Div("No recent news available.", style={"color": THEME["muted"], "marginTop": "10px"}),
+    ])
     return html.Div([top_cards, html.Div(style={"height": "16px"}), company_overview(symbol, company_name, info), html.Div(style={"height": "16px"}), html.Div([signal_card, plan_card, ratios_card, quick_metrics], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(280px,1fr))", "gap": "16px"}), html.Div(style={"height": "16px"}), html.Div([links, news_preview], style={"display": "grid", "gridTemplateColumns": "1fr 1.3fr", "gap": "16px"})])
 
 
 def build_chart_page(symbol, df, indicators):
     fig = make_chart(df, symbol, indicators)
-    controls = style_card([html.Div("Editable Indicators", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Checklist(id="chart-indicator-checklist", options=[{"label": "SMA20", "value": "SMA20"}, {"label": "SMA50", "value": "SMA50"}, {"label": "SMA200", "value": "SMA200"}, {"label": "EMA20", "value": "EMA20"}, {"label": "EMA50", "value": "EMA50"}, {"label": "Bollinger", "value": "Bollinger"}, {"label": "Supertrend", "value": "Supertrend"}, {"label": "MACD", "value": "MACD"}, {"label": "RSI", "value": "RSI"}], value=indicators, inline=True, inputStyle={"marginRight": "6px", "marginLeft": "14px"}, labelStyle={"display": "inline-flex", "alignItems": "center", "marginBottom": "10px", "color": THEME["text"]})])
+    controls = style_card([
+        html.Div("Editable Indicators", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}),
+        dcc.Checklist(id="chart-indicator-checklist", options=[{"label": "SMA20", "value": "SMA20"}, {"label": "SMA50", "value": "SMA50"}, {"label": "SMA200", "value": "SMA200"}, {"label": "EMA20", "value": "EMA20"}, {"label": "EMA50", "value": "EMA50"}, {"label": "Bollinger", "value": "Bollinger"}, {"label": "Supertrend", "value": "Supertrend"}, {"label": "MACD", "value": "MACD"}, {"label": "RSI", "value": "RSI"}], value=indicators, inline=True, inputStyle={"marginRight": "6px", "marginLeft": "14px"}, labelStyle={"display": "inline-flex", "alignItems": "center", "marginBottom": "10px", "color": THEME["text"]}),
+    ])
     return html.Div([controls, html.Div(style={"height": "14px"}), dcc.Graph(figure=fig, config={"displaylogo": False, "responsive": True})])
 
 
 def build_financials_page(symbol, info, holders, fin_tables):
-    top = html.Div([stat_card("PE Ratio", fmt_num(info.get("trailingPE")), "Trailing PE"), stat_card("PB Ratio", fmt_num(info.get("priceToBook")), "Price to book"), stat_card("ROE", fmt_pct(info.get("returnOnEquity")), "Return on equity"), stat_card("Dividend Yield", fmt_pct(info.get("dividendYield")), "Dividend yield")], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(220px,1fr))", "gap": "16px"})
-    profile = style_card([html.Div("Company Fundamentals", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), metric_line("Sector", str(info.get("sector", "-"))), metric_line("Industry", str(info.get("industry", "-"))), metric_line("Employees", fmt_int(info.get("fullTimeEmployees"))), metric_line("Enterprise Value", fmt_market_cap(info.get("enterpriseValue"))), metric_line("Book Value", fmt_num(info.get("bookValue"))), metric_line("EPS", fmt_num(info.get("trailingEps"))), metric_line("Beta", fmt_num(info.get("beta"))), metric_line("Profit Margin", fmt_pct(info.get("profitMargins"))),])
-    holders_card = style_card([html.Div("Shareholding Tables", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.H4("Institutional Holders", style={"marginBottom": "10px"}), df_to_table(holders.get("institutional_holders"), rows=8), html.Div(style={"height": "12px"}), html.H4("Mutual Fund Holders", style={"marginBottom": "10px"}), df_to_table(holders.get("mutualfund_holders"), rows=8),])
-    financial_tables = html.Div([style_card([html.H4("Annual Income Statement", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("income_stmt"), rows=12)]), style_card([html.H4("Annual Balance Sheet", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("balance_sheet"), rows=12)]), style_card([html.H4("Annual Cash Flow", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("cashflow"), rows=12)])], style={"display": "grid", "gridTemplateColumns": "1fr", "gap": "16px"})
-    links = style_card([html.Div("External Research", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), html.A("Open Screener Company Page", href=screener_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style())])
+    top = html.Div([
+        stat_card("PE Ratio", fmt_num(info.get("trailingPE")), "Trailing PE"),
+        stat_card("PB Ratio", fmt_num(info.get("priceToBook")), "Price to book"),
+        stat_card("ROE", fmt_pct(info.get("returnOnEquity")), "Return on equity"),
+        stat_card("Dividend Yield", fmt_pct(info.get("dividendYield")), "Dividend yield"),
+    ], style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(220px,1fr))", "gap": "16px"})
+    profile = style_card([
+        html.Div("Company Fundamentals", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+        metric_line("Sector", str(info.get("sector", "-"))),
+        metric_line("Industry", str(info.get("industry", "-"))),
+        metric_line("Employees", fmt_int(info.get("fullTimeEmployees"))),
+        metric_line("Enterprise Value", fmt_market_cap(info.get("enterpriseValue"))),
+        metric_line("Book Value", fmt_num(info.get("bookValue"))),
+        metric_line("EPS", fmt_num(info.get("trailingEps"))),
+        metric_line("Beta", fmt_num(info.get("beta"))),
+        metric_line("Profit Margin", fmt_pct(info.get("profitMargins"))),
+    ])
+    holders_card = style_card([
+        html.Div("Shareholding Tables", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}),
+        html.H4("Institutional Holders", style={"marginBottom": "10px"}),
+        df_to_table(holders.get("institutional_holders"), rows=8),
+        html.Div(style={"height": "12px"}),
+        html.H4("Mutual Fund Holders", style={"marginBottom": "10px"}),
+        df_to_table(holders.get("mutualfund_holders"), rows=8),
+    ])
+    financial_tables = html.Div([
+        style_card([html.H4("Annual Income Statement", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("income_stmt"), rows=12)]),
+        style_card([html.H4("Annual Balance Sheet", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("balance_sheet"), rows=12)]),
+        style_card([html.H4("Annual Cash Flow", style={"marginBottom": "10px"}), df_to_table(fin_tables.get("cashflow"), rows=12)]),
+    ], style={"display": "grid", "gridTemplateColumns": "1fr", "gap": "16px"})
+    links = style_card([
+        html.Div("External Research", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}),
+        html.A("Open Screener Company Page", href=screener_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()),
+        html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()),
+        html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style()),
+    ])
     return html.Div([top, html.Div(style={"height": "16px"}), html.Div([profile, links], style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"}), html.Div(style={"height": "16px"}), holders_card, html.Div(style={"height": "16px"}), financial_tables])
 
 
 def build_news_page(news_items, symbol):
-    header = style_card([html.Div("News & Order Flow", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}), html.Div(f"Latest news for {symbol}", style={"fontSize": "24px", "fontWeight": "800", "marginTop": "10px"}), html.Div("Bulk or block deal discovery is provided through NSE and Moneycontrol links, while recent feed items appear below.", style={"marginTop": "8px", "color": THEME["muted"]}), html.Div(style={"marginTop": "12px"}, children=[html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style())])])
+    header = style_card([
+        html.Div("News & Order Flow", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
+        html.Div(f"Latest news for {symbol}", style={"fontSize": "24px", "fontWeight": "800", "marginTop": "10px"}),
+        html.Div("Bulk or block deal discovery is provided through NSE and Moneycontrol links, while recent feed items appear below.", style={"marginTop": "8px", "color": THEME["muted"]}),
+        html.Div(style={"marginTop": "12px"}, children=[html.A("NSE Large Deals", href=nse_bulk_url(), target="_blank", rel="noopener noreferrer", style=button_link_style()), html.A("Moneycontrol Bulk Deals", href=moneycontrol_bulk_url(symbol), target="_blank", rel="noopener noreferrer", style=button_link_style())]),
+    ])
     return html.Div([header, html.Div(style={"height": "16px"}), build_news_cards(news_items)])
 
 
@@ -622,9 +967,26 @@ def _scan_one(symbol, company):
     try:
         hist = fetch_stock_history(symbol)
         hist = add_indicators(hist)
-        sig, score, conf, _ = generate_signal(hist)
+        info = fetch_stock_info(symbol)
+        news_items = fetch_stock_news(symbol)
+        sig, score, conf, reasons, parts = generate_signal(hist, info=info, news_items=news_items, symbol=symbol)
         last = hist.iloc[-1]
-        return {"symbol": symbol, "company": company, "signal": sig, "confidence": conf, "close": round(float(last["Close"]), 2), "rsi": round(float(last["RSI14"]), 2) if pd.notna(last["RSI14"]) else None}
+        intraday = parts.get("intraday", {})
+        return {
+            "symbol": symbol,
+            "company": company,
+            "signal": sig,
+            "confidence": conf,
+            "close": round(float(last["Close"]), 2),
+            "rsi": round(float(last["RSI14"]), 2) if pd.notna(last["RSI14"]) else None,
+            "score": score,
+            "technical": parts.get("technical_score", 0),
+            "fundamental": parts.get("fundamental_score", 0),
+            "flow": parts.get("flow_score", 0),
+            "news": parts.get("news_score", 0),
+            "vwap_dist_pct": round(float(intraday.get("vwap_dist_pct")), 2) if pd.notna(intraday.get("vwap_dist_pct")) else None,
+            "vol_spike": round(float(intraday.get("vol_spike")), 2) if pd.notna(intraday.get("vol_spike")) else None,
+        }
     except Exception:
         return None
 
@@ -653,6 +1015,7 @@ try:
 except Exception:
     SCAN_DF = pd.DataFrame(columns=["symbol", "company", "signal", "confidence", "close", "rsi"])
 
+
 DEFAULT_INDICATORS = ["SMA20", "SMA50", "SMA200", "Bollinger", "Supertrend", "MACD", "RSI"]
 
 app.layout = html.Div([
@@ -666,7 +1029,7 @@ app.layout = html.Div([
             style_card([html.Div("Smart Technical Scanner", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Dropdown(id="signal-filter-dropdown", options=[{"label": "All", "value": "ALL"}, {"label": "Strong Buy", "value": "STRONG BUY"}, {"label": "Buy", "value": "BUY"}, {"label": "Hold", "value": "HOLD"}, {"label": "Nil", "value": "NIL"}, {"label": "Sell", "value": "SELL"}, {"label": "Strong Sell", "value": "STRONG SELL"}], value="ALL", clearable=False, style={"color": "#111827"}), html.Div(id="scanner-table-container", style={"marginTop": "12px"})]),
         ], style={"display": "grid", "gridTemplateColumns": "0.95fr 1.35fr", "gap": "16px"}),
         html.Div(style={"height": "18px"}),
-        dcc.Tabs(id="main-tabs", value="home", parent_className="custom-tabs", className="custom-tabs-container", children=[dcc.Tab(label="Home", value="home", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Chart", value="chart", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Financials", value="financials", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="News", value="news", className="custom-tab", selected_className="custom-tab--selected")]),
+        dcc.Tabs(id="main-tabs", value="home", parent_className="custom-tabs", className="custom-tabs-container", children=[dcc.Tab(label="Home", value="home", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Chart", value="chart", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Financials", value="financials", className="custom-tab", selected_class_name="custom-tab--selected"), dcc.Tab(label="News", value="news", className="custom-tab", selected_class_name="custom-tab--selected")]),
         html.Div(id="main-tab-content", style={"marginTop": "18px"}),
     ], style={"maxWidth": "1450px", "margin": "0 auto", "padding": "28px 18px 60px 18px"})
 ], style={"minHeight": "100vh", "background": f"radial-gradient(circle at top left, {THEME['bg3']}, {THEME['bg']})", "color": THEME["text"], "fontFamily": "Inter, Segoe UI, Arial, sans-serif"})
@@ -723,7 +1086,19 @@ def render_scanner(signal_value):
     show = df.head(20).copy()
     return dash_table.DataTable(
         data=show.to_dict("records"),
-        columns=[{"name": "Symbol", "id": "symbol"}, {"name": "Company", "id": "company"}, {"name": "Signal", "id": "signal"}, {"name": "Confidence %", "id": "confidence"}, {"name": "Close", "id": "close"}, {"name": "RSI", "id": "rsi"}],
+        columns=[
+            {"name": "Symbol", "id": "symbol"},
+            {"name": "Company", "id": "company"},
+            {"name": "Signal", "id": "signal"},
+            {"name": "Confidence %", "id": "confidence"},
+            {"name": "Close", "id": "close"},
+            {"name": "RSI", "id": "rsi"},
+            {"name": "Score", "id": "score"},
+            {"name": "Tech", "id": "technical"},
+            {"name": "Fund", "id": "fundamental"},
+            {"name": "Flow", "id": "flow"},
+            {"name": "News", "id": "news"},
+        ],
         style_table={"overflowX": "auto"},
         style_header={"backgroundColor": THEME["bg3"], "color": THEME["text"], "fontWeight": "700", "border": f"1px solid {THEME['border']}"},
         style_cell={"backgroundColor": THEME["panel"], "color": THEME["text"], "border": f"1px solid {THEME['border']}", "padding": "10px", "textAlign": "left"},
@@ -750,7 +1125,7 @@ def render_main_content(tab, symbol, indicators):
         news_items = fetch_stock_news(symbol)
         holders = fetch_holders_tables(symbol)
         fin_tables = fetch_financial_tables(symbol)
-        signal, score, confidence, reasons = generate_signal(df, info=info, news_count=len(news_items), deals_bias=0)
+        signal, score, confidence, reasons, parts = generate_signal(df, info=info, news_items=news_items, symbol=symbol)
         return build_tab_content(tab, symbol, company_name, info, df, signal, score, confidence, reasons, news_items, holders, fin_tables, indicators)
     except Exception as e:
         return style_card([html.Div("Data Error", style={"fontSize": "22px", "fontWeight": "800", "color": THEME["danger"]}), html.Div(str(e), style={"marginTop": "10px", "color": THEME["text"], "lineHeight": "1.7"})])
