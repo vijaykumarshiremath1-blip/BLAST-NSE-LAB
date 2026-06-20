@@ -590,18 +590,13 @@ def fetch_stock_history(symbol):
         try:
             ticker = yf.Ticker(f"{symbol}.NS")
             df = ticker.history(period="1y", interval="1d", auto_adjust=False)
-            if df.empty:
-                raise ValueError(f"No market data found for {symbol}")
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-            return df
+            if df is None or df.empty:
+                raise ValueError("No market data found")
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
         except Exception as e:
             last_error = e
-            msg = str(e).lower()
-            if "too many requests" in msg or "rate limited" in msg:
-                time.sleep(3 * (attempt + 1))
-            else:
-                break
-    raise ValueError(f"Yahoo Finance temporarily unavailable for {symbol}: {last_error}")
+            time.sleep(2 * (attempt + 1))
+    raise ValueError(f"Yahoo Finance unavailable for {symbol}: {last_error}")
 
 
 @cache.memoize(timeout=1800)
@@ -1029,7 +1024,8 @@ app.layout = html.Div([
             style_card([html.Div("Smart Technical Scanner", style={"color": THEME["muted"], "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px", "marginBottom": "12px"}), dcc.Dropdown(id="signal-filter-dropdown", options=[{"label": "All", "value": "ALL"}, {"label": "Strong Buy", "value": "STRONG BUY"}, {"label": "Buy", "value": "BUY"}, {"label": "Hold", "value": "HOLD"}, {"label": "Nil", "value": "NIL"}, {"label": "Sell", "value": "SELL"}, {"label": "Strong Sell", "value": "STRONG SELL"}], value="ALL", clearable=False, style={"color": "#111827"}), html.Div(id="scanner-table-container", style={"marginTop": "12px"})]),
         ], style={"display": "grid", "gridTemplateColumns": "0.95fr 1.35fr", "gap": "16px"}),
         html.Div(style={"height": "18px"}),
-        dcc.Tabs(id="main-tabs", value="home", parent_className="custom-tabs", className="custom-tabs-container", children=[dcc.Tab(label="Home", value="home", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Chart", value="chart", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Financials", value="financials", className="custom-tab", selected_class_name="custom-tab--selected"), dcc.Tab(label="News", value="news", className="custom-tab", selected_class_name="custom-tab--selected")]),
+        dcc.Tabs(id="main-tabs", value="home", parent_className="custom-tabs", className="custom-tabs-container", children=[dcc.Tab(label="Home", value="home", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Chart", value="chart", className="custom-tab", selected_className="custom-tab--selected"), dcc.Tab(label="Financials", value="financials", className="custom-tab", selected_className="custom-tab--selected")
+dcc.Tab(label="News", value="news", className="custom-tab", selected_className="custom-tab--selected"),
         html.Div(id="main-tab-content", style={"marginTop": "18px"}),
     ], style={"maxWidth": "1450px", "margin": "0 auto", "padding": "28px 18px 60px 18px"})
 ], style={"minHeight": "100vh", "background": f"radial-gradient(circle at top left, {THEME['bg3']}, {THEME['bg']})", "color": THEME["text"], "fontFamily": "Inter, Segoe UI, Arial, sans-serif"})
